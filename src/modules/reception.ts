@@ -96,6 +96,7 @@ export async function receptionRoutes(app: FastifyInstance) {
           returning id`
         customerId = c.id
       }
+      if (!customerId) return reply.code(400).send({ error: 'Cliente inválido' })
 
       // Viatura: usar existente, encontrar por matrícula, ou criar
       let vehicleId = d.vehicle.id
@@ -110,6 +111,7 @@ export async function receptionRoutes(app: FastifyInstance) {
           returning id`
         vehicleId = v.id
       }
+      if (!vehicleId) return reply.code(400).send({ error: 'Viatura inválida' })
 
       // Gerar número da JO
       const [{ next_jo_number: number }] = await tx`
