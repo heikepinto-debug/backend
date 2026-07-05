@@ -315,6 +315,20 @@ export async function receptionRoutes(app: FastifyInstance) {
     })
   })
 
+  // ── SERVIÇOS de uma unidade (catálogo por sector) ──────────
+  app.get('/services', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+    const unitId = String((req.query as any).unitId || '')
+    if (!unitId) return reply.code(400).send({ error: 'unitId em falta' })
+    return withTenant(req.user.tid, async (tx) => {
+      const rows = await tx`
+        select id, name, category, est_hours
+        from service_catalog
+        where business_unit_id = ${unitId} and active
+        order by sort, name`
+      return { data: rows }
+    })
+  })
+
   // ── SYNC OFFLINE: recebe lote do tablet ────────────────────
   app.post('/sync/push', { preHandler: [guard('reception:create')] }, async (req: any, reply) => {
     const body = z.object({
