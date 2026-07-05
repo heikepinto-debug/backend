@@ -43,7 +43,11 @@ const ReceptionSchema = z.object({
   reportedIssues: z.string().optional(),
   declaredValuables: z.string().min(1),        // obrigatório — mesmo "nenhum"
   checklist: z.record(z.boolean()).default({}),
-  damageZones: z.array(z.string()).default([]),
+  damageZones: z.array(z.object({
+    id: z.string(),                 // liga à foto do dano (zone = 'damage-<id>')
+    area: z.string(),               // ex: 'Porta esquerda', 'Jante diant. dir.'
+    note: z.string().optional(),
+  })).default([]),
   serviceType: z.string().optional(),
   serviceDescription: z.string().min(3),
   priority: z.enum(['normal','urgent']).default('normal'),
@@ -68,6 +72,21 @@ export async function receptionRoutes(app: FastifyInstance) {
       return { data: rows }
     })
   })
+
+  // ── VIATURAS de um cliente (atalho p/ cliente recorrente) ──
+  app.get('/customers/:customerId/vehicles', { preHandler: [guard('customer:read')] },
+    async (req: any) => {
+      const { customerId } = req.params
+      return withTenant(req.user.tid, async (tx) => {
+        const rows = await tx`
+          select v.id, v.plate, v.brand, v.model, v.year, v.color,
+            (select max(jo.received_at) from job_orders jo where jo.vehicle_id = v.id) as last_visit
+          from vehicles v
+          where v.customer_id = ${customerId}
+          order by last_visit desc nulls last`
+        return { data: rows }
+      })
+    })
 
   // ── JOB ORDER: criação completa da recepção blindada ───────
   app.post('/receptions', { preHandler: [guard('reception:create')] }, async (req: any, reply) => {
