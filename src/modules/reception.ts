@@ -283,6 +283,8 @@ export async function receptionRoutes(app: FastifyInstance) {
   // ── LISTAR / DETALHE ───────────────────────────────────────
   app.get('/receptions', { preHandler: [guard('reception:read')] }, async (req: any) => {
     const q = req.query as any
+    const search = String(q.search || '').trim()
+    const like = search ? `%${search}%` : null
     return withTenant(req.user.tid, async (tx) => {
       const rows = await tx`
         select jo.id, jo.number, jo.status, jo.priority, jo.source,
@@ -295,12 +297,45 @@ export async function receptionRoutes(app: FastifyInstance) {
         join vehicles v on v.id = jo.vehicle_id
         join customers c on c.id = jo.customer_id
         left join users u on u.id = jo.received_by
-        where (${q.status || null}::text is null or jo.status = ${q.status || null})
+        where jo.status <> 'cancelled'
+          and (${q.status || null}::text is null or jo.status = ${q.status || null})
+          and (${like}::text is null
+               or v.plate ilike ${like}
+               or c.full_name ilike ${like}
+               or jo.number ilike ${like})
         order by jo.received_at desc
-        limit ${Math.min(Number(q.limit) || 30, 100)}`
+        limit ${Math.min(Number(q.limit) || 50, 100)}`
       return { data: rows }
     })
   })
+
+  // ── APAGAR entrada — só o dono ─────────────────────────────
+  // Modo seguro (default): marca como cancelada, fica no audit trail.
+  // Modo definitivo (?hard=true): remove mesmo da base de dados.
+  app.delete('/receptions/:joId', { preHandler: [guard('jobdelete:any')] },
+    async (req: any, reply) => {
+      const { joId } = req.params
+      const hard = String((req.query as any).hard || '') === 'true'
+      return withTenant(req.user.tid, async (tx) => {
+        const [jo] = await tx`select number, entry_pdf_path from job_orders where id = ${joId}`
+        if (!jo) return reply.code(404).send({ error: 'Entrada não encontrada' })
+
+        if (hard) {
+          // apaga fotos do storage
+          const photos = await tx`select storage_path from reception_photos where job_order_id = ${joId}`
+          const paths = photos.map((p: any) => p.storage_path).filter(Boolean)
+          if (jo.entry_pdf_path) paths.push(jo.entry_pdf_path)
+          if (paths.length) { try { await supabase.storage.from(BUCKET).remove(paths) } catch {} }
+          await tx`delete from reception_photos where job_order_id = ${joId}`
+          await tx`delete from job_orders where id = ${joId}`
+          await audit(tx, req.user.tid, req.user.sub, 'reception.hard_delete', 'job_order', joId, { number: jo.number })
+        } else {
+          await tx`update job_orders set status = 'cancelled', updated_at = now() where id = ${joId}`
+          await audit(tx, req.user.tid, req.user.sub, 'reception.cancel', 'job_order', joId, { number: jo.number })
+        }
+        return reply.send({ ok: true, deleted: hard })
+      })
+    })
 
   app.get('/receptions/:joId', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
     const { joId } = req.params
