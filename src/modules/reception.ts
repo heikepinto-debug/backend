@@ -5,6 +5,7 @@
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import { withTenant, audit, can, supabase, BUCKET, sql } from '../lib/core.js'
+import { generateEntryPdf } from '../lib/pdf.js'
 
 // Guard: exige permissão + módulo M1 activo
 function guard(perm: string) {
@@ -237,7 +238,45 @@ export async function receptionRoutes(app: FastifyInstance) {
         await audit(tx, req.user.tid, req.user.sub, 'reception.sign', 'job_order', joId, {
           requiredPhotos: Number(count),
         })
-        return reply.send({ ok: true, sealed: true })
+        // Gera e arquiva o PDF de entrada automaticamente (não bloqueia a resposta se falhar)
+        let pdfPath: string | null = null
+        try { pdfPath = await generateEntryPdf(req.user.tid, joId) } catch (e) { app.log.error(e) }
+        return reply.send({ ok: true, sealed: true, pdfPath })
+      })
+    })
+
+  // ── FOTO DO DOCUMENTO DE IDENTIFICAÇÃO ─────────────────────
+  app.post('/receptions/:joId/id-document', { preHandler: [guard('reception:create')] },
+    async (req: any, reply) => {
+      const body = z.object({ imageBase64: z.string().min(100) }).safeParse(req.body)
+      if (!body.success) return reply.code(400).send({ error: 'Imagem em falta' })
+      const { joId } = req.params
+      const path = `${req.user.tid}/${joId}/id-document-${Date.now()}.jpg`
+      const buffer = Buffer.from(body.data.imageBase64, 'base64')
+      const { error } = await supabase.storage.from(BUCKET)
+        .upload(path, buffer, { contentType: 'image/jpeg' })
+      if (error) return reply.code(500).send({ error: 'Falha ao guardar documento' })
+      return withTenant(req.user.tid, async (tx) => {
+        await tx`update job_orders set id_document_path = ${path} where id = ${joId}`
+        await audit(tx, req.user.tid, req.user.sub, 'reception.id_document', 'job_order', joId, {})
+        return reply.send({ ok: true })
+      })
+    })
+
+  // ── EXPORTAR / DESCARREGAR O PDF DE ENTRADA ────────────────
+  app.get('/receptions/:joId/pdf', { preHandler: [guard('reception:read')] },
+    async (req: any, reply) => {
+      const { joId } = req.params
+      return withTenant(req.user.tid, async (tx) => {
+        const [jo] = await tx`select entry_pdf_path from job_orders where id = ${joId}`
+        let path = jo?.entry_pdf_path
+        if (!path) {                                  // ainda não gerado — gera agora
+          try { path = await generateEntryPdf(req.user.tid, joId) }
+          catch { return reply.code(500).send({ error: 'Falha ao gerar o PDF' }) }
+        }
+        const { data, error } = await supabase.storage.from(BUCKET).createSignedUrl(path, 3600)
+        if (error || !data) return reply.code(500).send({ error: 'Falha ao obter o PDF' })
+        return reply.send({ url: data.signedUrl })
       })
     })
 
@@ -303,7 +342,8 @@ export async function receptionRoutes(app: FastifyInstance) {
   app.get('/terms/active', { preHandler: [guard('reception:read')] }, async (req: any) => {
     return withTenant(req.user.tid, async (tx) => {
       const [t] = await tx`
-        select version, content, parking_fee, parking_grace_hours
+        select version, content, parking_fee, parking_grace_days,
+               quote_approval_days, pickup_days, advance_threshold, advance_percent
         from terms_versions where active order by created_at desc limit 1`
       return t || null
     })
