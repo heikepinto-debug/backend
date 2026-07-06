@@ -55,8 +55,41 @@ const ReceptionSchema = z.object({
   serviceDescription: z.string().optional(),        // notas gerais adicionais
   priority: z.enum(['normal','urgent']).default('normal'),
   estimatedDelivery: z.string().optional(),
+  bookingDate: z.string().optional(),               // marcação do cliente (opcional)
   termsVersion: z.string(),
   termsAcceptedAt: z.string(),
+})
+
+// Rascunho: só cliente + viatura são obrigatórios; o resto é livre.
+const DraftSchema = z.object({
+  draftId: z.string().uuid().optional(),            // se existe, actualiza
+  businessUnitId: z.string().uuid(),
+  source: z.enum(['walkin','phone','whatsapp','website','app','manual']).default('walkin'),
+  customer: z.object({
+    id: z.string().uuid().optional(),
+    fullName: z.string().min(2).optional(),
+    phone: z.string().min(6).optional(),
+    email: z.string().email().optional().or(z.literal('')),
+    nif: z.string().optional(),
+  }),
+  vehicle: z.object({
+    id: z.string().uuid().optional(),
+    plate: z.string().min(3),
+    brand: z.string().optional(),
+    model: z.string().optional(),
+    year: z.number().int().optional(),
+    color: z.string().optional(),
+  }),
+  kmEntry: z.number().int().min(0).optional(),
+  fuelLevel: z.number().int().min(0).max(8).optional(),
+  declaredValuables: z.string().optional(),
+  checklist: z.record(z.boolean()).default({}),
+  damageZones: z.array(z.object({
+    id: z.string(), area: z.string(), note: z.string().optional(),
+  })).default([]),
+  intentions: z.array(z.string()).default([]),
+  serviceDescription: z.string().optional(),
+  bookingDate: z.string().optional(),
 })
 
 export async function receptionRoutes(app: FastifyInstance) {
@@ -106,6 +139,9 @@ export async function receptionRoutes(app: FastifyInstance) {
         if (existing) return reply.send({ id: existing.id, number: existing.number, duplicate: true })
       }
 
+      // Finalizar um rascunho existente? (mantém o mesmo registo e número)
+      const draftId = (req.body as any).draftId as string | undefined
+
       // Cliente: usar existente ou criar
       let customerId = d.customer.id
       if (!customerId) {
@@ -135,7 +171,31 @@ export async function receptionRoutes(app: FastifyInstance) {
       }
       if (!vehicleId) return reply.code(400).send({ error: 'Viatura inválida' })
 
-      // Gerar número da JO
+      // Caso A: finalizar um rascunho existente → actualiza e sela
+      if (draftId) {
+        const [existing] = await tx`
+          select id, number, status from job_orders where id = ${draftId}`
+        if (existing && existing.status === 'draft') {
+          const [jo] = await tx`
+            update job_orders set
+              business_unit_id = ${d.businessUnitId}, customer_id = ${customerId}, vehicle_id = ${vehicleId},
+              status = 'awaiting_diagnosis', source = ${d.source},
+              km_entry = ${d.kmEntry}, fuel_level = ${d.fuelLevel},
+              declared_valuables = ${d.declaredValuables},
+              checklist = ${JSON.stringify(d.checklist)}, damage_zones = ${JSON.stringify(d.damageZones)},
+              intentions = ${JSON.stringify(d.intentions)}, service_description = ${d.serviceDescription || null},
+              priority = ${d.priority}, booking_date = ${d.bookingDate || null},
+              received_by = ${req.user.sub}, received_at = now(),
+              terms_version = ${d.termsVersion}, terms_accepted_at = ${d.termsAcceptedAt},
+              updated_at = now()
+            where id = ${draftId}
+            returning id, number`
+          await audit(tx, req.user.tid, req.user.sub, 'reception.finalize_draft', 'job_order', jo.id, { number: jo.number })
+          return reply.code(201).send({ id: jo.id, number: jo.number })
+        }
+      }
+
+      // Caso B: nova entrada de raiz
       const [{ next_jo_number: number }] = await tx`
         select next_jo_number(${req.user.tid})`
 
@@ -145,14 +205,14 @@ export async function receptionRoutes(app: FastifyInstance) {
           status, source, km_entry, fuel_level, reported_issues,
           declared_valuables, checklist, damage_zones,
           intentions, service_description, priority, estimated_delivery,
-          received_by, offline_id, terms_version, terms_accepted_at
+          booking_date, received_by, offline_id, terms_version, terms_accepted_at
         ) values (
           ${req.user.tid}, ${d.businessUnitId}, ${number}, ${customerId}, ${vehicleId},
           'awaiting_diagnosis', ${d.source}, ${d.kmEntry}, ${d.fuelLevel},
           ${d.reportedIssues || null}, ${d.declaredValuables},
           ${JSON.stringify(d.checklist)}, ${JSON.stringify(d.damageZones)},
           ${JSON.stringify(d.intentions)}, ${d.serviceDescription || null}, ${d.priority},
-          ${d.estimatedDelivery || null}, ${req.user.sub}, ${d.offlineId || null},
+          ${d.estimatedDelivery || null}, ${d.bookingDate || null}, ${req.user.sub}, ${d.offlineId || null},
           ${d.termsVersion}, ${d.termsAcceptedAt}
         ) returning id, number`
 
@@ -161,6 +221,101 @@ export async function receptionRoutes(app: FastifyInstance) {
       })
 
       return reply.code(201).send({ id: jo.id, number: jo.number })
+    })
+  })
+
+  // ── GUARDAR RASCUNHO (cliente+viatura mínimo; resto livre) ──
+  app.post('/receptions/draft', { preHandler: [guard('reception:create')] }, async (req: any, reply) => {
+    const body = DraftSchema.safeParse(req.body)
+    if (!body.success)
+      return reply.code(400).send({ error: 'Cliente e viatura são o mínimo para guardar', details: body.error.flatten() })
+    const d = body.data
+    return withTenant(req.user.tid, async (tx) => {
+      // Cliente
+      let customerId = d.customer.id
+      if (!customerId) {
+        if (!d.customer.fullName || !d.customer.phone)
+          return reply.code(400).send({ error: 'Nome e telemóvel do cliente são obrigatórios' })
+        const [c] = await tx`
+          insert into customers (tenant_id, full_name, phone, email, created_by)
+          values (${req.user.tid}, ${d.customer.fullName}, ${d.customer.phone}, ${d.customer.email || null}, ${req.user.sub})
+          returning id`
+        customerId = c.id
+      }
+      // Viatura
+      let vehicleId = d.vehicle.id
+      if (!vehicleId) {
+        const plate = d.vehicle.plate.toUpperCase().trim()
+        const [v] = await tx`
+          insert into vehicles (tenant_id, customer_id, plate, brand, model, year)
+          values (${req.user.tid}, ${customerId}, ${plate}, ${d.vehicle.brand || null}, ${d.vehicle.model || null}, ${d.vehicle.year || null})
+          on conflict (tenant_id, plate) do update set customer_id = ${customerId}
+          returning id`
+        vehicleId = v.id
+      }
+
+      // Actualiza rascunho existente ou cria novo
+      if (d.draftId) {
+        const [existing] = await tx`select id, number, status from job_orders where id = ${d.draftId}`
+        if (existing && existing.status === 'draft') {
+          await tx`
+            update job_orders set
+              business_unit_id = ${d.businessUnitId}, customer_id = ${customerId}, vehicle_id = ${vehicleId},
+              source = ${d.source}, km_entry = ${d.kmEntry ?? 0}, fuel_level = ${d.fuelLevel ?? 4},
+              declared_valuables = ${d.declaredValuables || ''},
+              checklist = ${JSON.stringify(d.checklist)}, damage_zones = ${JSON.stringify(d.damageZones)},
+              intentions = ${JSON.stringify(d.intentions)}, service_description = ${d.serviceDescription || null},
+              booking_date = ${d.bookingDate || null}, updated_at = now()
+            where id = ${d.draftId}`
+          return reply.send({ id: existing.id, number: existing.number, draft: true })
+        }
+      }
+      const [{ next_jo_number: number }] = await tx`select next_jo_number(${req.user.tid})`
+      const [jo] = await tx`
+        insert into job_orders (
+          tenant_id, business_unit_id, number, customer_id, vehicle_id, status, source,
+          km_entry, fuel_level, declared_valuables, checklist, damage_zones,
+          intentions, service_description, booking_date, received_by, draft_created_at
+        ) values (
+          ${req.user.tid}, ${d.businessUnitId}, ${number}, ${customerId}, ${vehicleId}, 'draft', ${d.source},
+          ${d.kmEntry ?? 0}, ${d.fuelLevel ?? 4}, ${d.declaredValuables || ''},
+          ${JSON.stringify(d.checklist)}, ${JSON.stringify(d.damageZones)},
+          ${JSON.stringify(d.intentions)}, ${d.serviceDescription || null}, ${d.bookingDate || null},
+          ${req.user.sub}, now()
+        ) returning id, number`
+      await audit(tx, req.user.tid, req.user.sub, 'reception.draft_save', 'job_order', jo.id, { number: jo.number })
+      return reply.send({ id: jo.id, number: jo.number, draft: true })
+    })
+  })
+
+  // ── CARREGAR RASCUNHO para retomar ──────────────────────────
+  app.get('/receptions/:joId/draft', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+    const { joId } = req.params
+    return withTenant(req.user.tid, async (tx) => {
+      const [jo] = await tx`
+        select j.*, c.id as customer_id, c.full_name as customer_name, c.phone as customer_phone, c.email as customer_email,
+          v.id as vehicle_id, v.plate, v.brand, v.model, v.year
+        from job_orders j
+        join customers c on c.id = j.customer_id
+        join vehicles v on v.id = j.vehicle_id
+        where j.id = ${joId}`
+      if (!jo) return reply.code(404).send({ error: 'Rascunho não encontrado' })
+      return reply.send({ data: jo })
+    })
+  })
+
+  // ── MUDAR ESTADO MANUALMENTE — só o dono (temporário) ───────
+  app.post('/receptions/:joId/status', { preHandler: [guard('jobdelete:any')] }, async (req: any, reply) => {
+    const { joId } = req.params
+    const status = String((req.body as any).status || '')
+    const allowed = ['awaiting_diagnosis','awaiting_quote','quote_sent','approved','in_progress','quality_check','ready','delivered']
+    if (!allowed.includes(status)) return reply.code(400).send({ error: 'Estado inválido' })
+    return withTenant(req.user.tid, async (tx) => {
+      const [jo] = await tx`select number, status from job_orders where id = ${joId}`
+      if (!jo) return reply.code(404).send({ error: 'Entrada não encontrada' })
+      await tx`update job_orders set status = ${status}::jo_status, updated_at = now() where id = ${joId}`
+      await audit(tx, req.user.tid, req.user.sub, 'reception.status_change', 'job_order', joId, { from: jo.status, to: status })
+      return reply.send({ ok: true, status })
     })
   })
 
