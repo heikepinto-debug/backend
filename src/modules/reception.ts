@@ -48,8 +48,10 @@ const ReceptionSchema = z.object({
     area: z.string(),               // ex: 'Porta esquerda', 'Jante diant. dir.'
     note: z.string().optional(),
   })).default([]),
-  serviceType: z.string().optional(),
-  serviceDescription: z.string().min(3),
+  // Intenção do cliente: várias, livres, sem trancar sector.
+  // O serviço "a sério" define-se depois no diagnóstico.
+  intentions: z.array(z.string().min(1)).min(1),   // ex: ['Barulho na frente','Quer Stage 2']
+  serviceDescription: z.string().optional(),        // notas gerais adicionais
   priority: z.enum(['normal','urgent']).default('normal'),
   estimatedDelivery: z.string().optional(),
   termsVersion: z.string(),
@@ -141,14 +143,14 @@ export async function receptionRoutes(app: FastifyInstance) {
           tenant_id, business_unit_id, number, customer_id, vehicle_id,
           status, source, km_entry, fuel_level, reported_issues,
           declared_valuables, checklist, damage_zones,
-          service_type, service_description, priority, estimated_delivery,
+          intentions, service_description, priority, estimated_delivery,
           received_by, offline_id, terms_version, terms_accepted_at
         ) values (
           ${req.user.tid}, ${d.businessUnitId}, ${number}, ${customerId}, ${vehicleId},
-          'awaiting_quote', ${d.source}, ${d.kmEntry}, ${d.fuelLevel},
+          'awaiting_diagnosis', ${d.source}, ${d.kmEntry}, ${d.fuelLevel},
           ${d.reportedIssues || null}, ${d.declaredValuables},
           ${JSON.stringify(d.checklist)}, ${JSON.stringify(d.damageZones)},
-          ${d.serviceType || null}, ${d.serviceDescription}, ${d.priority},
+          ${JSON.stringify(d.intentions)}, ${d.serviceDescription || null}, ${d.priority},
           ${d.estimatedDelivery || null}, ${req.user.sub}, ${d.offlineId || null},
           ${d.termsVersion}, ${d.termsAcceptedAt}
         ) returning id, number`
@@ -217,13 +219,14 @@ export async function receptionRoutes(app: FastifyInstance) {
       if (error) return reply.code(500).send({ error: 'Falha ao guardar assinatura' })
 
       return withTenant(req.user.tid, async (tx) => {
-        // Validação de integridade: exige 6 fotos obrigatórias antes de selar
+        // Validação de integridade: exige as 9 fotos obrigatórias antes de selar
+        // (6 zonas 360° + painel ignição, painel motor, conta-km)
         const [{ count }] = await tx`
           select count(*) from reception_photos
           where job_order_id = ${joId} and is_required = true`
-        if (Number(count) < 6)
+        if (Number(count) < 9)
           return reply.code(422).send({
-            error: `Só ${count} de 6 fotos obrigatórias — a JO não pode ser selada sem elas`,
+            error: `Só ${count} de 9 fotos obrigatórias — a JO não pode ser selada sem elas`,
           })
 
         await tx`
