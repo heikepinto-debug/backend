@@ -8,6 +8,16 @@ import { withTenant, supabase, BUCKET } from './core.js'
 const MZ = (n: number) => new Intl.NumberFormat('pt-PT').format(n)
 const FUEL_LABEL = (lvl: number) => `${Math.round((lvl / 8) * 100)}%`
 
+// Aceita jsonb vindo como objecto/array já parseado OU como string JSON.
+// Garante sempre o tipo esperado (default) para não rebentar no PDF.
+function asData<T>(value: any, fallback: T): T {
+  if (value == null) return fallback
+  if (typeof value === 'string') {
+    try { return JSON.parse(value) as T } catch { return fallback }
+  }
+  return value as T
+}
+
 // Gera o PDF em memória e devolve um Buffer
 function buildPdf(data: any): Promise<Buffer> {
   return new Promise((resolve, reject) => {
@@ -63,7 +73,7 @@ function buildPdf(data: any): Promise<Buffer> {
     y += 6
 
     section('INTENÇÃO DO CLIENTE')
-    const intentions: string[] = data.intentions || []
+    const intentions: string[] = asData<string[]>(data.intentions, [])
     if (intentions.length)
       intentions.forEach(it => {
         doc.fillColor(ink).fontSize(10).font('Helvetica').text(`• ${it}`, 50, y, { width: 495 })
@@ -78,13 +88,13 @@ function buildPdf(data: any): Promise<Buffer> {
     y += 10
 
     section('ESTADO E ITENS DECLARADOS')
-    const checklist = data.checklist || {}
+    const checklist = asData<Record<string, boolean>>(data.checklist, {})
     const items = Object.keys(checklist).filter(k => checklist[k])
     row('Itens presentes', items.length ? items.join(', ') : 'Nenhum assinalado')
     row('Objectos declarados', data.declared_valuables)
     y += 6
 
-    const damages = data.damage_zones || []
+    const damages = asData<any[]>(data.damage_zones, [])
     if (damages.length) {
       section('DANOS REGISTADOS À ENTRADA')
       damages.forEach((d: any, i: number) => {
