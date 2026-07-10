@@ -44,6 +44,9 @@ const ReceptionSchema = z.object({
   reportedIssues: z.string().optional(),
   declaredValuables: z.string().min(1),        // obrigatório — mesmo "nenhum"
   checklist: z.record(z.boolean()).default({}),
+  batteryReference: z.string().optional(),                  // referência da bateria
+  systemsCheck: z.record(z.enum(['ok','fail','untested'])).default({}),  // verificação de sistemas
+  wantsOldParts: z.boolean().optional(),                    // quer as peças antigas
   damageZones: z.array(z.object({
     id: z.string(),                 // liga à foto do dano (zone = 'damage-<id>')
     area: z.string(),               // ex: 'Porta esquerda', 'Jante diant. dir.'
@@ -84,6 +87,9 @@ const DraftSchema = z.object({
   fuelLevel: z.number().int().min(0).max(8).optional(),
   declaredValuables: z.string().optional(),
   checklist: z.record(z.boolean()).default({}),
+  batteryReference: z.string().optional(),
+  systemsCheck: z.record(z.enum(['ok','fail','untested'])).default({}),
+  wantsOldParts: z.boolean().optional(),
   damageZones: z.array(z.object({
     id: z.string(), area: z.string(), note: z.string().optional(),
   })).default([]),
@@ -183,6 +189,8 @@ export async function receptionRoutes(app: FastifyInstance) {
               km_entry = ${d.kmEntry}, fuel_level = ${d.fuelLevel},
               declared_valuables = ${d.declaredValuables},
               checklist = ${JSON.stringify(d.checklist)}, damage_zones = ${JSON.stringify(d.damageZones)},
+              battery_reference = ${d.batteryReference || null}, systems_check = ${JSON.stringify(d.systemsCheck)},
+              wants_old_parts = ${d.wantsOldParts ?? null},
               intentions = ${JSON.stringify(d.intentions)}, service_description = ${d.serviceDescription || null},
               priority = ${d.priority}, booking_date = ${d.bookingDate || null},
               received_by = ${req.user.sub}, received_at = now(),
@@ -206,6 +214,7 @@ export async function receptionRoutes(app: FastifyInstance) {
           tenant_id, business_unit_id, number, customer_id, vehicle_id,
           status, source, km_entry, fuel_level, reported_issues,
           declared_valuables, checklist, damage_zones,
+          battery_reference, systems_check, wants_old_parts,
           intentions, service_description, priority, estimated_delivery,
           booking_date, received_by, offline_id, terms_version, terms_accepted_at
         ) values (
@@ -213,6 +222,7 @@ export async function receptionRoutes(app: FastifyInstance) {
           'awaiting_diagnosis', ${d.source}, ${d.kmEntry}, ${d.fuelLevel},
           ${d.reportedIssues || null}, ${d.declaredValuables},
           ${JSON.stringify(d.checklist)}, ${JSON.stringify(d.damageZones)},
+          ${d.batteryReference || null}, ${JSON.stringify(d.systemsCheck)}, ${d.wantsOldParts ?? null},
           ${JSON.stringify(d.intentions)}, ${d.serviceDescription || null}, ${d.priority},
           ${d.estimatedDelivery || null}, ${d.bookingDate || null}, ${req.user.sub}, ${d.offlineId || null},
           ${d.termsVersion}, ${d.termsAcceptedAt}
@@ -266,6 +276,8 @@ export async function receptionRoutes(app: FastifyInstance) {
               source = ${d.source}, km_entry = ${d.kmEntry ?? 0}, fuel_level = ${d.fuelLevel ?? 4},
               declared_valuables = ${d.declaredValuables || ''},
               checklist = ${JSON.stringify(d.checklist)}, damage_zones = ${JSON.stringify(d.damageZones)},
+              battery_reference = ${d.batteryReference || null}, systems_check = ${JSON.stringify(d.systemsCheck)},
+              wants_old_parts = ${d.wantsOldParts ?? null},
               intentions = ${JSON.stringify(d.intentions)}, service_description = ${d.serviceDescription || null},
               booking_date = ${d.bookingDate || null}, updated_at = now()
             where id = ${d.draftId}`
@@ -277,11 +289,13 @@ export async function receptionRoutes(app: FastifyInstance) {
         insert into job_orders (
           tenant_id, business_unit_id, number, customer_id, vehicle_id, status, source,
           km_entry, fuel_level, declared_valuables, checklist, damage_zones,
+          battery_reference, systems_check, wants_old_parts,
           intentions, service_description, booking_date, draft_created_by, draft_created_at
         ) values (
           ${req.user.tid}, ${d.businessUnitId}, ${number}, ${customerId}, ${vehicleId}, 'draft', ${d.source},
           ${d.kmEntry ?? 0}, ${d.fuelLevel ?? 4}, ${d.declaredValuables || ''},
           ${JSON.stringify(d.checklist)}, ${JSON.stringify(d.damageZones)},
+          ${d.batteryReference || null}, ${JSON.stringify(d.systemsCheck)}, ${d.wantsOldParts ?? null},
           ${JSON.stringify(d.intentions)}, ${d.serviceDescription || null}, ${d.bookingDate || null},
           ${req.user.sub}, now()
         ) returning id, number`
@@ -549,6 +563,14 @@ export async function receptionRoutes(app: FastifyInstance) {
       const rows = await tx`
         select id, type, name from business_units where active order by name`
       return { data: rows }
+    })
+  })
+
+  // ── CONFIG da recepção (flags do tenant) ────────────────────
+  app.get('/reception-config', { preHandler: [guard('reception:read')] }, async (req: any) => {
+    return withTenant(req.user.tid, async (tx) => {
+      const [t] = await tx`select diagnosis_notice_on from tenants where id = ${req.user.tid}`
+      return { diagnosisNoticeOn: t?.diagnosis_notice_on ?? true }
     })
   })
 

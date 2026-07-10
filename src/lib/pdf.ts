@@ -137,7 +137,19 @@ function buildPdf(data: any): Promise<Buffer> {
     const items = Object.keys(checklist).filter(k => checklist[k])
     field('Itens presentes', items.length ? items.join(', ') : 'Nenhum assinalado')
     field('Objectos declarados', data.declared_valuables)
+    if (data.battery_reference) field('Referência da bateria', data.battery_reference)
+    if (data.wants_old_parts != null) field('Peças antigas', data.wants_old_parts ? 'Cliente quer ficar com as peças substituídas' : 'Cliente dispensa as peças substituídas')
     y += 8
+
+    // ── VERIFICAÇÃO DE SISTEMAS ─────────────────────────────
+    const systems = asData<Record<string, string>>(data.systems_check, {})
+    const sysKeys = Object.keys(systems)
+    if (sysKeys.length) {
+      sectionHeader('VERIFICAÇÃO DE SISTEMAS À ENTRADA')
+      const label: Record<string, string> = { ok: 'Funciona', fail: 'Não funciona', untested: 'Não testado' }
+      sysKeys.forEach(k => field(k, label[systems[k]] || systems[k]))
+      y += 8
+    }
 
     // ── DANOS ───────────────────────────────────────────────
     const damages = asData<any[]>(data.damage_zones, [])
