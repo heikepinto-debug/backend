@@ -462,6 +462,7 @@ export async function receptionRoutes(app: FastifyInstance) {
         select jo.id, jo.number, jo.status, jo.priority, jo.source,
                jo.km_entry, jo.received_at, jo.signed_at, jo.deletion_status,
                jo.deletion_reason,
+               jo.priority_level, jo.priority_reason, jo.priority_rank,
                v.plate, v.brand, v.model,
                c.full_name as customer_name, c.phone as customer_phone,
                u.full_name as received_by_name,
@@ -689,7 +690,37 @@ export async function receptionRoutes(app: FastifyInstance) {
   app.get('/reception-config', { preHandler: [guard('reception:read')] }, async (req: any) => {
     return withTenant(req.user.tid, async (tx) => {
       const [t] = await tx`select diagnosis_notice_on from tenants where id = ${req.user.tid}`
-      return { diagnosisNoticeOn: t?.diagnosis_notice_on ?? true }
+      const criteria = await tx`select id, label from priority_criteria where active order by sort_order`
+      return { diagnosisNoticeOn: t?.diagnosis_notice_on ?? true, priorityCriteria: criteria }
+    })
+  })
+
+  // ── PRIORIDADE: definir nível + razão ───────────────────────
+  app.post('/receptions/:joId/priority', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+    const { joId } = req.params
+    const b = req.body as any
+    const level = String(b.level || '')
+    if (!['urgent', 'high', 'normal', 'low'].includes(level))
+      return reply.code(400).send({ error: 'Nível inválido' })
+    if (!b.reason) return reply.code(400).send({ error: 'Razão obrigatória' })
+    return withTenant(req.user.tid, async (tx) => {
+      const [jo] = await tx`select number, priority_set_by from job_orders where id = ${joId}`
+      if (!jo) return reply.code(404).send({ error: 'Entrada não encontrada' })
+      // é uma correcção do dono? (alguém já tinha definido, e quem altera é diferente)
+      const isOwner = can(req.user.perms, 'jobdelete:any')
+      const isCorrection = isOwner && jo.priority_set_by && jo.priority_set_by !== req.user.sub
+      await tx`update job_orders set
+        priority_level = ${level}, priority_reason = ${b.reason},
+        priority_reason_note = ${b.note || null}, priority_rank = ${b.rank ?? 0},
+        priority_set_by = ${req.user.sub}, priority_set_at = now(),
+        updated_at = now() where id = ${joId}`
+      if (isCorrection) {
+        await tx`update job_orders set priority_corrected_by = ${req.user.sub}, priority_corrected_at = now() where id = ${joId}`
+      }
+      await audit(tx, req.user.tid, req.user.sub, isCorrection ? 'priority.correct' : 'priority.set', 'job_order', joId, {
+        number: jo.number, level, reason: b.reason, corrected: isCorrection,
+      })
+      return reply.send({ ok: true, corrected: isCorrection })
     })
   })
 
