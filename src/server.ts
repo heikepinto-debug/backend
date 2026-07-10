@@ -8,6 +8,7 @@ import jwt from '@fastify/jwt'
 import rateLimit from '@fastify/rate-limit'
 import { authRoutes } from './modules/auth.js'
 import { receptionRoutes } from './modules/reception.js'
+import { taskRoutes } from './modules/tasks.js'
 
 const app = Fastify({ logger: { level: process.env.NODE_ENV === 'production' ? 'warn' : 'info' } })
 
@@ -24,6 +25,7 @@ app.decorate('auth', async (req: any, reply: any) => {
 
 await app.register(authRoutes)
 await app.register(receptionRoutes, { prefix: '/api/v1' })
+await app.register(taskRoutes, { prefix: '/api/v1' })
 
 app.get('/health', async () => ({ ok: true, product: 'OficinaHub', version: '1.0.0' }))
 

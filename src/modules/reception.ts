@@ -189,8 +189,10 @@ export async function receptionRoutes(app: FastifyInstance) {
               terms_version = ${d.termsVersion}, terms_accepted_at = ${d.termsAcceptedAt},
               updated_at = now()
             where id = ${draftId}
-            returning id, number`
-          await audit(tx, req.user.tid, req.user.sub, 'reception.finalize_draft', 'job_order', jo.id, { number: jo.number })
+            returning id, number, draft_created_by`
+          await audit(tx, req.user.tid, req.user.sub, 'reception.finalize_draft', 'job_order', jo.id, {
+            number: jo.number, started_by: jo.draft_created_by, finalized_by: req.user.sub,
+          })
           return reply.code(201).send({ id: jo.id, number: jo.number })
         }
       }
@@ -275,7 +277,7 @@ export async function receptionRoutes(app: FastifyInstance) {
         insert into job_orders (
           tenant_id, business_unit_id, number, customer_id, vehicle_id, status, source,
           km_entry, fuel_level, declared_valuables, checklist, damage_zones,
-          intentions, service_description, booking_date, received_by, draft_created_at
+          intentions, service_description, booking_date, draft_created_by, draft_created_at
         ) values (
           ${req.user.tid}, ${d.businessUnitId}, ${number}, ${customerId}, ${vehicleId}, 'draft', ${d.source},
           ${d.kmEntry ?? 0}, ${d.fuelLevel ?? 4}, ${d.declaredValuables || ''},
@@ -498,11 +500,13 @@ export async function receptionRoutes(app: FastifyInstance) {
       const [jo] = await tx`
         select jo.*, v.plate, v.brand, v.model, v.year, v.color,
                c.full_name as customer_name, c.phone as customer_phone,
-               u.full_name as received_by_name
+               u.full_name as received_by_name,
+               ub.full_name as draft_created_by_name
         from job_orders jo
         join vehicles v on v.id = jo.vehicle_id
         join customers c on c.id = jo.customer_id
         left join users u on u.id = jo.received_by
+        left join users ub on ub.id = jo.draft_created_by
         where jo.id = ${joId}`
       if (!jo) return reply.code(404).send({ error: 'JO não encontrada' })
 
