@@ -299,6 +299,7 @@ export async function receptionRoutes(app: FastifyInstance) {
           ${JSON.stringify(d.intentions)}, ${d.serviceDescription || null}, ${d.bookingDate || null},
           ${req.user.sub}, now()
         ) returning id, number`
+      if (d.bookingDate) await tx`update job_orders set booking_status = 'scheduled' where id = ${jo.id}`
       await audit(tx, req.user.tid, req.user.sub, 'reception.draft_save', 'job_order', jo.id, { number: jo.number })
       return reply.send({ id: jo.id, number: jo.number, draft: true })
     })
@@ -459,15 +460,18 @@ export async function receptionRoutes(app: FastifyInstance) {
     return withTenant(req.user.tid, async (tx) => {
       const rows = await tx`
         select jo.id, jo.number, jo.status, jo.priority, jo.source,
-               jo.km_entry, jo.received_at, jo.signed_at,
+               jo.km_entry, jo.received_at, jo.signed_at, jo.deletion_status,
+               jo.deletion_reason,
                v.plate, v.brand, v.model,
                c.full_name as customer_name, c.phone as customer_phone,
                u.full_name as received_by_name,
+               ur.full_name as deletion_requested_by_name,
                (select count(*) from reception_photos p where p.job_order_id = jo.id) as photo_count
         from job_orders jo
         join vehicles v on v.id = jo.vehicle_id
         join customers c on c.id = jo.customer_id
         left join users u on u.id = jo.received_by
+        left join users ur on ur.id = jo.deletion_requested_by
         where jo.status <> 'cancelled'
           and (${q.status || null}::text is null or jo.status = ${q.status || null})
           and (${like}::text is null
@@ -508,6 +512,119 @@ export async function receptionRoutes(app: FastifyInstance) {
       })
     })
 
+  // ── MARCAÇÕES: lista os rascunhos com data de marcação ──────
+  app.get('/bookings', { preHandler: [guard('reception:read')] }, async (req: any) => {
+    return withTenant(req.user.tid, async (tx) => {
+      const rows = await tx`
+        select jo.id, jo.number, jo.booking_date, jo.booking_status, jo.status,
+               jo.cancel_reason, jo.intentions,
+               v.plate, v.brand, v.model,
+               c.full_name as customer_name, c.phone as customer_phone
+        from job_orders jo
+        join vehicles v on v.id = jo.vehicle_id
+        join customers c on c.id = jo.customer_id
+        where jo.tenant_id = ${req.user.tid}
+          and jo.booking_date is not null
+          and jo.status = 'draft'
+          and coalesce(jo.booking_status, '') <> 'cancelled'
+        order by jo.booking_date asc`
+      return { data: rows }
+    })
+  })
+
+  // ── MARCAÇÕES: remarcar (mudar a data) ──────────────────────
+  app.post('/bookings/:joId/reschedule', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+    const { joId } = req.params
+    const newDate = String((req.body as any).bookingDate || '')
+    if (!newDate) return reply.code(400).send({ error: 'Nova data em falta' })
+    return withTenant(req.user.tid, async (tx) => {
+      const [jo] = await tx`select number, booking_date from job_orders where id = ${joId} and status = 'draft'`
+      if (!jo) return reply.code(404).send({ error: 'Marcação não encontrada' })
+      await tx`update job_orders set booking_date = ${newDate}, booking_status = 'scheduled', updated_at = now() where id = ${joId}`
+      await audit(tx, req.user.tid, req.user.sub, 'booking.reschedule', 'job_order', joId, {
+        number: jo.number, from: jo.booking_date, to: newDate,
+      })
+      return reply.send({ ok: true })
+    })
+  })
+
+  // ── MARCAÇÕES: cancelar (com motivo obrigatório) ────────────
+  app.post('/bookings/:joId/cancel', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+    const { joId } = req.params
+    const reason = String((req.body as any).reason || '')
+    const note = String((req.body as any).note || '')
+    if (!reason) return reply.code(400).send({ error: 'Motivo obrigatório' })
+    return withTenant(req.user.tid, async (tx) => {
+      const [jo] = await tx`select number from job_orders where id = ${joId} and status = 'draft'`
+      if (!jo) return reply.code(404).send({ error: 'Marcação não encontrada' })
+      await tx`update job_orders set booking_status = 'cancelled', cancel_reason = ${reason},
+        cancel_reason_note = ${note || null}, cancelled_by = ${req.user.sub}, cancelled_at = now(),
+        updated_at = now() where id = ${joId}`
+      await audit(tx, req.user.tid, req.user.sub, 'booking.cancel', 'job_order', joId, {
+        number: jo.number, reason, note,
+      })
+      return reply.send({ ok: true })
+    })
+  })
+
+  // ── ELIMINAÇÃO: pedir (qualquer recepção, com motivo) ───────
+  app.post('/receptions/:joId/request-deletion', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+    const { joId } = req.params
+    const reason = String((req.body as any).reason || '')
+    if (!reason) return reply.code(400).send({ error: 'Motivo obrigatório' })
+    return withTenant(req.user.tid, async (tx) => {
+      const [jo] = await tx`select number, deletion_status from job_orders where id = ${joId}`
+      if (!jo) return reply.code(404).send({ error: 'Entrada não encontrada' })
+      if (jo.deletion_status === 'pending') return reply.code(409).send({ error: 'Já existe um pedido pendente' })
+      await tx`update job_orders set deletion_status = 'pending', deletion_reason = ${reason},
+        deletion_requested_by = ${req.user.sub}, deletion_requested_at = now(), updated_at = now()
+        where id = ${joId}`
+      await audit(tx, req.user.tid, req.user.sub, 'deletion.request', 'job_order', joId, { number: jo.number, reason })
+      return reply.send({ ok: true })
+    })
+  })
+
+  // ── ELIMINAÇÃO: lista de pedidos pendentes (só dono) ────────
+  app.get('/deletion-requests', { preHandler: [guard('jobdelete:any')] }, async (req: any) => {
+    return withTenant(req.user.tid, async (tx) => {
+      const rows = await tx`
+        select jo.id, jo.number, jo.deletion_reason, jo.deletion_requested_at,
+               u.full_name as requested_by_name,
+               v.plate, c.full_name as customer_name
+        from job_orders jo
+        join vehicles v on v.id = jo.vehicle_id
+        join customers c on c.id = jo.customer_id
+        left join users u on u.id = jo.deletion_requested_by
+        where jo.tenant_id = ${req.user.tid} and jo.deletion_status = 'pending'
+        order by jo.deletion_requested_at asc`
+      return { data: rows }
+    })
+  })
+
+  // ── ELIMINAÇÃO: aprovar ou recusar (só dono) ────────────────
+  app.post('/receptions/:joId/decide-deletion', { preHandler: [guard('jobdelete:any')] }, async (req: any, reply) => {
+    const { joId } = req.params
+    const approve = (req.body as any).approve === true
+    const note = String((req.body as any).note || '')
+    return withTenant(req.user.tid, async (tx) => {
+      const [jo] = await tx`select number, deletion_status from job_orders where id = ${joId}`
+      if (!jo) return reply.code(404).send({ error: 'Entrada não encontrada' })
+      if (jo.deletion_status !== 'pending') return reply.code(409).send({ error: 'Sem pedido pendente' })
+      if (approve) {
+        await tx`update job_orders set status = 'cancelled', deletion_status = 'approved',
+          deletion_decided_by = ${req.user.sub}, deletion_decided_at = now(),
+          deletion_decision_note = ${note || null}, updated_at = now() where id = ${joId}`
+        await audit(tx, req.user.tid, req.user.sub, 'deletion.approve', 'job_order', joId, { number: jo.number, note })
+      } else {
+        await tx`update job_orders set deletion_status = 'rejected',
+          deletion_decided_by = ${req.user.sub}, deletion_decided_at = now(),
+          deletion_decision_note = ${note || null}, updated_at = now() where id = ${joId}`
+        await audit(tx, req.user.tid, req.user.sub, 'deletion.reject', 'job_order', joId, { number: jo.number, note })
+      }
+      return reply.send({ ok: true, approved: approve })
+    })
+  })
+
   app.get('/receptions/:joId', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
     const { joId } = req.params
     return withTenant(req.user.tid, async (tx) => {
@@ -515,12 +632,14 @@ export async function receptionRoutes(app: FastifyInstance) {
         select jo.*, v.plate, v.brand, v.model, v.year, v.color,
                c.full_name as customer_name, c.phone as customer_phone,
                u.full_name as received_by_name,
-               ub.full_name as draft_created_by_name
+               ub.full_name as draft_created_by_name,
+               ur.full_name as deletion_requested_by_name
         from job_orders jo
         join vehicles v on v.id = jo.vehicle_id
         join customers c on c.id = jo.customer_id
         left join users u on u.id = jo.received_by
         left join users ub on ub.id = jo.draft_created_by
+        left join users ur on ur.id = jo.deletion_requested_by
         where jo.id = ${joId}`
       if (!jo) return reply.code(404).send({ error: 'JO não encontrada' })
 
