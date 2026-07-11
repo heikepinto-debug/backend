@@ -10,15 +10,29 @@ import { authRoutes } from './modules/auth.js'
 import { receptionRoutes } from './modules/reception.js'
 import { taskRoutes } from './modules/tasks.js'
 import { osRoutes } from './modules/os.js'
+import { sql } from './lib/core.js'
 
 const app = Fastify({ logger: { level: process.env.NODE_ENV === 'production' ? 'warn' : 'info' } })
 
-// Handler global de erros: em vez do "Internal Server Error" genérico,
-// devolve a mensagem real, para diagnóstico. (Segurança: só a mensagem,
-// não o stack completo.)
-app.setErrorHandler((error, _req, reply) => {
+// Handler global de erros: devolve a mensagem real (não o stack) e regista
+// o erro na tabela error_logs, para diagnóstico remoto de outras oficinas.
+app.setErrorHandler(async (error, req, reply) => {
   app.log.error(error)
   const status = (error as any).statusCode && (error as any).statusCode >= 400 ? (error as any).statusCode : 500
+
+  // Regista só erros de servidor (500+); os 4xx são do cliente e não interessam.
+  if (status >= 500) {
+    try {
+      const u: any = (req as any).user || {}
+      // rota sem query string (evita vazar dados sensíveis nos parâmetros)
+      const route = (req.url || '').split('?')[0]
+      await sql`
+        insert into error_logs (tenant_id, user_id, method, route, status_code, message, error_code)
+        values (${u.tid || null}, ${u.sub || null}, ${req.method || null}, ${route || null},
+                ${status}, ${(error.message || '').slice(0, 500)}, ${(error as any).code || null})`
+    } catch { /* nunca deixar o logging rebentar a resposta */ }
+  }
+
   reply.code(status).send({ error: error.message || 'Erro interno', code: (error as any).code })
 })
 

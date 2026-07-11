@@ -22,6 +22,18 @@ async function logState(tx: any, tid: string, joId: string, from: string | null,
 }
 
 export async function osRoutes(app: FastifyInstance) {
+  // ── Logs de erro recentes (só dono) — diagnóstico ───────────
+  app.get('/error-logs', { preHandler: [guard('jobdelete:any')] }, async (req: any) => {
+    return withTenant(req.user.tid, async (tx) => {
+      const rows = await tx`
+        select id, method, route, status_code, message, error_code, created_at, user_id
+        from error_logs
+        where tenant_id = ${req.user.tid} or tenant_id is null
+        order by created_at desc limit 100`
+      return { data: rows }
+    })
+  })
+
   // ── Lista de diagnósticos a aguardar autorização ────────────
   // (para o cartão do autorizador — ex: Edgar). Exclui os que ele
   // próprio submeteu, pois não pode autorizar o seu próprio diagnóstico.
