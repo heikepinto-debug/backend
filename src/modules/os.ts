@@ -21,6 +21,28 @@ async function logState(tx: any, tid: string, joId: string, from: string | null,
 }
 
 export async function osRoutes(app: FastifyInstance) {
+  // ── Lista de diagnósticos a aguardar autorização ────────────
+  // (para o cartão do autorizador — ex: Edgar). Exclui os que ele
+  // próprio submeteu, pois não pode autorizar o seu próprio diagnóstico.
+  app.get('/os/awaiting-authorization', { preHandler: [guard('reception:read')] }, async (req: any) => {
+    return withTenant(req.user.tid, async (tx) => {
+      const rows = await tx`
+        select jo.id, jo.number, jo.diag_submitted_at,
+               v.plate, v.brand, v.model,
+               c.full_name as customer_name,
+               us.full_name as submitted_by_name
+        from job_orders jo
+        join vehicles v on v.id = jo.vehicle_id
+        join customers c on c.id = jo.customer_id
+        left join users us on us.id = jo.diag_submitted_by
+        where jo.tenant_id = ${req.user.tid}
+          and jo.status = 'diagnosis_review'
+          and (jo.diag_submitted_by is null or jo.diag_submitted_by <> ${req.user.sub})
+        order by jo.diag_submitted_at asc`
+      return { data: rows }
+    })
+  })
+
   // ── Iniciar OS a partir de uma recepção ─────────────────────
   app.post('/os/start/:joId', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
     const { joId } = req.params
@@ -96,13 +118,16 @@ export async function osRoutes(app: FastifyInstance) {
     const { pid } = req.params
     const b = req.body as any
     return withTenant(req.user.tid, async (tx) => {
-      const [p] = await tx`select id from problems where id = ${pid}`
+      const [p] = await tx`select id, job_order_id from problems where id = ${pid}`
       if (!p) return reply.code(404).send({ error: 'Problema não encontrado' })
       await tx`update problems set
         description = coalesce(${b.description ?? null}, description),
         diagnosis = coalesce(${b.diagnosis ?? null}, diagnosis),
         status = coalesce(${b.status ?? null}, status),
         updated_at = now() where id = ${pid}`
+      await audit(tx, req.user.tid, req.user.sub, 'os.problem_update', 'problem', pid, {
+        job_order_id: p.job_order_id, fields: Object.keys(b),
+      })
       return reply.send({ ok: true })
     })
   })
@@ -111,7 +136,12 @@ export async function osRoutes(app: FastifyInstance) {
   app.delete('/os/problems/:pid', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
     const { pid } = req.params
     return withTenant(req.user.tid, async (tx) => {
+      const [p] = await tx`select job_order_id, description from problems where id = ${pid}`
+      if (!p) return reply.code(404).send({ error: 'Problema não encontrado' })
       await tx`delete from problems where id = ${pid}`
+      await audit(tx, req.user.tid, req.user.sub, 'os.problem_delete', 'problem', pid, {
+        job_order_id: p.job_order_id, description: p.description,
+      })
       return reply.send({ ok: true })
     })
   })
@@ -126,6 +156,7 @@ export async function osRoutes(app: FastifyInstance) {
       const { data: signed, error } = await supabase.storage.from(BUCKET).createSignedUploadUrl(path)
       if (error) return reply.code(500).send({ error: 'Erro no upload' })
       await tx`insert into problem_photos (tenant_id, problem_id, path) values (${req.user.tid}, ${pid}, ${path})`
+      await audit(tx, req.user.tid, req.user.sub, 'os.problem_photo', 'problem', pid, {})
       return reply.send({ uploadUrl: signed.signedUrl, path })
     })
   })
