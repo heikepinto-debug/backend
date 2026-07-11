@@ -185,8 +185,11 @@ function buildPdf(data: any): Promise<Buffer> {
     }
     doc.moveTo(M, y + 62).lineTo(M + 200, y + 62).strokeColor(line).stroke()
     doc.moveTo(colR, y + 62).lineTo(colR + 200, y + 62).strokeColor(line).stroke()
-    doc.fillColor(muted).fontSize(8).font('Helvetica').text('Assinatura do cliente', M, y + 66)
-    doc.fillColor(ink).fontSize(10).font('Helvetica-Bold').text(clean(data.customer_name), M, y + 78)
+    doc.fillColor(muted).fontSize(8).font('Helvetica').text(data.signer_is_owner === false ? 'Assinatura de quem entregou o veículo' : 'Assinatura do cliente', M, y + 66)
+    doc.fillColor(ink).fontSize(10).font('Helvetica-Bold').text(clean(data.signer_is_owner === false && data.signer_name ? data.signer_name : data.customer_name), M, y + 78)
+    if (data.signer_is_owner === false) {
+      doc.fillColor(muted).fontSize(7).font('Helvetica').text(`(em nome do proprietário ${clean(data.customer_name)})`, M, y + 91)
+    }
     doc.fillColor(muted).fontSize(8).font('Helvetica').text('Técnico responsável pelo levantamento', colR, y + 66)
     doc.fillColor(ink).fontSize(10).font('Helvetica-Bold').text(clean(data.received_by_name || '—'), colR, y + 78)
 

@@ -381,6 +381,9 @@ export async function receptionRoutes(app: FastifyInstance) {
     async (req: any, reply) => {
       const body = z.object({
         signatureBase64: z.string().min(100),   // PNG data-url sem prefixo
+        signerIsOwner: z.boolean().default(true),
+        signerName: z.string().optional(),
+        signerRelation: z.string().optional(),
       }).safeParse(req.body)
       if (!body.success) return reply.code(400).send({ error: 'Assinatura em falta' })
       const { joId } = req.params
@@ -392,23 +395,27 @@ export async function receptionRoutes(app: FastifyInstance) {
       if (error) return reply.code(500).send({ error: 'Falha ao guardar assinatura' })
 
       return withTenant(req.user.tid, async (tx) => {
-        // Validação de integridade: exige as 9 fotos obrigatórias antes de selar
-        // (6 zonas 360° + painel ignição, painel motor, conta-km)
+        // Validação de integridade: exige as fotos obrigatórias antes de selar.
+        // O frontend já garante todas as fotos; isto é uma rede de segurança
+        // contra selar uma JO sem fotos nenhumas.
         const [{ count }] = await tx`
           select count(*) from reception_photos
           where job_order_id = ${joId} and is_required = true`
         if (Number(count) < 9)
           return reply.code(422).send({
-            error: `Só ${count} de 9 fotos obrigatórias — a JO não pode ser selada sem elas`,
+            error: `Só ${count} fotos obrigatórias — a JO não pode ser selada sem elas`,
           })
 
         await tx`
           update job_orders
-          set signature_url = ${path}, signed_at = now()
+          set signature_url = ${path}, signed_at = now(),
+              signer_is_owner = ${body.data.signerIsOwner},
+              signer_name = ${body.data.signerName || null},
+              signer_relation = ${body.data.signerRelation || null}
           where id = ${joId}`
 
         await audit(tx, req.user.tid, req.user.sub, 'reception.sign', 'job_order', joId, {
-          requiredPhotos: Number(count),
+          requiredPhotos: Number(count), signerIsOwner: body.data.signerIsOwner,
         })
         // Gera e arquiva o PDF de entrada automaticamente (não bloqueia a resposta se falhar)
         let pdfPath: string | null = null
