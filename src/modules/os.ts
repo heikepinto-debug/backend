@@ -11,7 +11,8 @@ import { withTenant, audit, can, supabase, BUCKET } from '../lib/core.js'
 
 function guard(perm: string) {
   return async (req: any, reply: any) => {
-    if (!can(req.user.perms, perm)) return reply.code(403).send({ error: 'Sem permissão' })
+    try { await req.jwtVerify() } catch { return reply.code(401).send({ error: 'Não autenticado' }) }
+    if (!can(req.user.perms, perm)) return reply.code(403).send({ error: 'Sem permissão', needed: perm })
   }
 }
 
