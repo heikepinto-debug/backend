@@ -377,6 +377,17 @@ export async function receptionRoutes(app: FastifyInstance) {
     })
 
   // ── ASSINATURA: guarda o PNG da assinatura e sela a JO ──────
+  // ── BI: verificar se já temos este número na base ───────────
+  app.get('/identity/:biNumber', { preHandler: [guard('reception:create')] }, async (req: any) => {
+    const biNumber = String(req.params.biNumber || '').trim()
+    if (!biNumber) return { found: false }
+    return withTenant(req.user.tid, async (tx) => {
+      const [doc] = await tx`select full_name, doc_path from identity_docs
+        where bi_number = ${biNumber} limit 1`
+      return doc ? { found: true, fullName: doc.full_name, hasPhoto: !!doc.doc_path } : { found: false }
+    })
+  })
+
   app.post('/receptions/:joId/sign', { preHandler: [guard('reception:create')] },
     async (req: any, reply) => {
       const body = z.object({
@@ -384,6 +395,7 @@ export async function receptionRoutes(app: FastifyInstance) {
         signerIsOwner: z.boolean().default(true),
         signerName: z.string().optional(),
         signerRelation: z.string().optional(),
+        signerBiNumber: z.string().optional(),
       }).safeParse(req.body)
       if (!body.success) return reply.code(400).send({ error: 'Assinatura em falta' })
       const { joId } = req.params
@@ -411,7 +423,8 @@ export async function receptionRoutes(app: FastifyInstance) {
           set signature_url = ${path}, signed_at = now(),
               signer_is_owner = ${body.data.signerIsOwner},
               signer_name = ${body.data.signerName || null},
-              signer_relation = ${body.data.signerRelation || null}
+              signer_relation = ${body.data.signerRelation || null},
+              signer_bi_number = ${body.data.signerBiNumber || null}
           where id = ${joId}`
 
         await audit(tx, req.user.tid, req.user.sub, 'reception.sign', 'job_order', joId, {
@@ -427,7 +440,11 @@ export async function receptionRoutes(app: FastifyInstance) {
   // ── FOTO DO DOCUMENTO DE IDENTIFICAÇÃO ─────────────────────
   app.post('/receptions/:joId/id-document', { preHandler: [guard('reception:create')] },
     async (req: any, reply) => {
-      const body = z.object({ imageBase64: z.string().min(100) }).safeParse(req.body)
+      const body = z.object({
+        imageBase64: z.string().min(100),
+        biNumber: z.string().optional(),
+        fullName: z.string().optional(),
+      }).safeParse(req.body)
       if (!body.success) return reply.code(400).send({ error: 'Imagem em falta' })
       const { joId } = req.params
       const path = `${req.user.tid}/${joId}/id-document-${Date.now()}.jpg`
@@ -437,6 +454,13 @@ export async function receptionRoutes(app: FastifyInstance) {
       if (error) return reply.code(500).send({ error: 'Falha ao guardar documento' })
       return withTenant(req.user.tid, async (tx) => {
         await tx`update job_orders set id_document_path = ${path} where id = ${joId}`
+        // guarda na base de BIs (uma vez por número), se veio o número
+        if (body.data.biNumber) {
+          await tx`insert into identity_docs (tenant_id, bi_number, full_name, doc_path)
+            values (${req.user.tid}, ${body.data.biNumber}, ${body.data.fullName || ''}, ${path})
+            on conflict (tenant_id, bi_number) do update set doc_path = excluded.doc_path,
+              full_name = case when identity_docs.full_name = '' then excluded.full_name else identity_docs.full_name end`
+        }
         await audit(tx, req.user.tid, req.user.sub, 'reception.id_document', 'job_order', joId, {})
         return reply.send({ ok: true })
       })
