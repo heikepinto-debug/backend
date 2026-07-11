@@ -430,10 +430,10 @@ export async function receptionRoutes(app: FastifyInstance) {
         await audit(tx, req.user.tid, req.user.sub, 'reception.sign', 'job_order', joId, {
           requiredPhotos: Number(count), signerIsOwner: body.data.signerIsOwner,
         })
-        // Gera e arquiva o PDF de entrada automaticamente (não bloqueia a resposta se falhar)
-        let pdfPath: string | null = null
-        try { pdfPath = await generateEntryPdf(req.user.tid, joId) } catch (e) { app.log.error(e) }
-        return reply.send({ ok: true, sealed: true, pdfPath })
+        // O PDF de entrada é gerado sob procura (quando alguém o abre), não aqui —
+        // gerá-lo agora obrigava a descarregar as 14 fotos e bloqueava a finalização
+        // durante muito tempo. A resposta volta imediatamente após selar a assinatura.
+        return reply.send({ ok: true, sealed: true })
       })
     })
 

@@ -67,35 +67,44 @@ export async function osRoutes(app: FastifyInstance) {
   })
 
   // ── Ver a OS (dados + lista de problemas) ───────────────────
-  app.get('/os/:joId', { preHandler: [guard('reception:read')] }, async (req: any) => {
+  app.get('/os/:joId', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
     const { joId } = req.params
-    return withTenant(req.user.tid, async (tx) => {
-      const [jo] = await tx`
-        select jo.*, v.plate, v.brand, v.model, c.full_name as customer_name,
-               uo.full_name as os_opened_by_name,
-               us.full_name as diag_submitted_by_name,
-               ua.full_name as diag_authorized_by_name
-        from job_orders jo
-        join vehicles v on v.id = jo.vehicle_id
-        join customers c on c.id = jo.customer_id
-        left join users uo on uo.id = jo.os_opened_by
-        left join users us on us.id = jo.diag_submitted_by
-        left join users ua on ua.id = jo.diag_authorized_by
-        where jo.id = ${joId}`
-      if (!jo) return { error: 'não encontrada' }
-      const problems = await tx`select * from problems where job_order_id = ${joId} order by sort_order, created_at`
-      // fotos por problema
-      for (const p of problems as any[]) {
-        const photos = await tx`select id, path from problem_photos where problem_id = ${p.id}`
-        p.photos = []
-        for (const ph of photos as any[]) {
-          const { data } = await supabase.storage.from(BUCKET).createSignedUrl(ph.path, 3600)
-          p.photos.push({ id: ph.id, url: data?.signedUrl })
+    try {
+      return await withTenant(req.user.tid, async (tx) => {
+        const [jo] = await tx`
+          select jo.*, v.plate, v.brand, v.model, c.full_name as customer_name,
+                 uo.full_name as os_opened_by_name,
+                 us.full_name as diag_submitted_by_name,
+                 ua.full_name as diag_authorized_by_name
+          from job_orders jo
+          join vehicles v on v.id = jo.vehicle_id
+          join customers c on c.id = jo.customer_id
+          left join users uo on uo.id = jo.os_opened_by
+          left join users us on us.id = jo.diag_submitted_by
+          left join users ua on ua.id = jo.diag_authorized_by
+          where jo.id = ${joId}`
+        if (!jo) return reply.code(404).send({ error: 'não encontrada' })
+        const problems = await tx`select * from problems where job_order_id = ${joId} order by sort_order, created_at`
+        // fotos por problema (protegido — uma falha de storage não deita a OS abaixo)
+        for (const p of problems as any[]) {
+          p.photos = []
+          try {
+            const photos = await tx`select id, path from problem_photos where problem_id = ${p.id}`
+            for (const ph of photos as any[]) {
+              try {
+                const { data } = await supabase.storage.from(BUCKET).createSignedUrl(ph.path, 3600)
+                p.photos.push({ id: ph.id, url: data?.signedUrl })
+              } catch { /* foto indisponível — segue */ }
+            }
+          } catch { /* sem fotos — segue */ }
         }
-      }
-      const [tenant] = await tx`select diag_authorization_on from tenants where id = ${req.user.tid}`
-      return { jo, problems, diagAuthorizationOn: tenant?.diag_authorization_on ?? true }
-    })
+        const [tenant] = await tx`select diag_authorization_on from tenants where id = ${req.user.tid}`
+        return { jo, problems, diagAuthorizationOn: tenant?.diag_authorization_on ?? true }
+      })
+    } catch (e: any) {
+      app.log.error({ err: e, joId }, 'os load failed')
+      return reply.code(500).send({ error: `Erro ao carregar OS: ${e?.message || 'desconhecido'}` })
+    }
   })
 
   // ── Adicionar um problema (achado da equipa) ────────────────
