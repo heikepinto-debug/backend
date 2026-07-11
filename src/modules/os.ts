@@ -46,24 +46,30 @@ export async function osRoutes(app: FastifyInstance) {
   // ── Iniciar OS a partir de uma recepção ─────────────────────
   app.post('/os/start/:joId', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
     const { joId } = req.params
-    return withTenant(req.user.tid, async (tx) => {
-      const [jo] = await tx`select id, number, status, intentions, os_opened_at from job_orders where id = ${joId}`
-      if (!jo) return reply.code(404).send({ error: 'Recepção não encontrada' })
-      if (jo.os_opened_at) return reply.code(409).send({ error: 'OS já foi iniciada' })
-      if (jo.status === 'draft') return reply.code(400).send({ error: 'Recepção ainda é rascunho' })
+    try {
+      return await withTenant(req.user.tid, async (tx) => {
+        const [jo] = await tx`select id, number, status, intentions, os_opened_at from job_orders where id = ${joId}`
+        if (!jo) return reply.code(404).send({ error: 'Recepção não encontrada' })
+        if (jo.os_opened_at) return reply.code(409).send({ error: 'OS já foi iniciada' })
+        if (jo.status === 'draft') return reply.code(400).send({ error: 'Recepção ainda é rascunho' })
 
-      // puxa as queixas do cliente como problemas iniciais
-      const intentions = typeof jo.intentions === 'string' ? JSON.parse(jo.intentions) : (jo.intentions || [])
-      let order = 0
-      for (const it of intentions) {
-        await tx`insert into problems (tenant_id, job_order_id, description, origin, sort_order, created_by)
-          values (${req.user.tid}, ${joId}, ${it}, 'customer', ${order++}, ${req.user.sub})`
-      }
-      await tx`update job_orders set status = 'in_diagnosis', os_opened_at = now(), os_opened_by = ${req.user.sub}, updated_at = now() where id = ${joId}`
-      await logState(tx, req.user.tid, joId, jo.status, 'in_diagnosis', req.user.sub)
-      await audit(tx, req.user.tid, req.user.sub, 'os.start', 'job_order', joId, { number: jo.number })
-      return reply.code(201).send({ ok: true })
-    })
+        // puxa as queixas do cliente como problemas iniciais
+        const intentions = typeof jo.intentions === 'string' ? JSON.parse(jo.intentions) : (jo.intentions || [])
+        let order = 0
+        for (const it of intentions) {
+          const text = typeof it === 'string' ? it : (it?.text || it?.description || String(it))
+          await tx`insert into problems (tenant_id, job_order_id, description, origin, sort_order, created_by)
+            values (${req.user.tid}, ${joId}, ${text}, 'customer', ${order++}, ${req.user.sub})`
+        }
+        await tx`update job_orders set status = 'in_diagnosis', os_opened_at = now(), os_opened_by = ${req.user.sub}, updated_at = now() where id = ${joId}`
+        await logState(tx, req.user.tid, joId, jo.status, 'in_diagnosis', req.user.sub)
+        await audit(tx, req.user.tid, req.user.sub, 'os.start', 'job_order', joId, { number: jo.number })
+        return reply.code(201).send({ ok: true })
+      })
+    } catch (e: any) {
+      app.log.error({ err: e, joId }, 'os start failed')
+      return reply.code(500).send({ error: `Erro ao iniciar OS: ${e?.message || 'desconhecido'}` })
+    }
   })
 
   // ── Ver a OS (dados + lista de problemas) ───────────────────
