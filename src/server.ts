@@ -13,6 +13,15 @@ import { osRoutes } from './modules/os.js'
 
 const app = Fastify({ logger: { level: process.env.NODE_ENV === 'production' ? 'warn' : 'info' } })
 
+// Handler global de erros: em vez do "Internal Server Error" genérico,
+// devolve a mensagem real, para diagnóstico. (Segurança: só a mensagem,
+// não o stack completo.)
+app.setErrorHandler((error, _req, reply) => {
+  app.log.error(error)
+  const status = (error as any).statusCode && (error as any).statusCode >= 400 ? (error as any).statusCode : 500
+  reply.code(status).send({ error: error.message || 'Erro interno', code: (error as any).code })
+})
+
 await app.register(cors, {
   origin: (process.env.CORS_ORIGINS || 'http://localhost:5173').split(','),
   credentials: true,
