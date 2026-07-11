@@ -463,6 +463,7 @@ export async function receptionRoutes(app: FastifyInstance) {
                jo.km_entry, jo.received_at, jo.signed_at, jo.deletion_status,
                jo.deletion_reason,
                jo.priority_level, jo.priority_reason, jo.priority_rank,
+               jo.os_opened_at,
                v.plate, v.brand, v.model,
                c.full_name as customer_name, c.phone as customer_phone,
                u.full_name as received_by_name,
