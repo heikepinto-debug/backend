@@ -22,6 +22,46 @@ async function logState(tx: any, tid: string, joId: string, from: string | null,
 }
 
 export async function osRoutes(app: FastifyInstance) {
+  // ── Resumo para o painel inicial (números de relance) ───────
+  app.get('/dashboard/summary', { preHandler: [guard('reception:read')] }, async (req: any) => {
+    return withTenant(req.user.tid, async (tx) => {
+      const [counts] = await tx`
+        select
+          count(*) filter (where status not in ('draft','delivered','cancelled'))::int as in_shop,
+          count(*) filter (where status in ('awaiting_diagnosis','in_diagnosis','diagnosis_review'))::int as diagnosing,
+          count(*) filter (where status in ('awaiting_quote','quote_sent','approved','in_progress','quality_check'))::int as working,
+          count(*) filter (where status = 'ready')::int as ready,
+          count(*) filter (where status = 'draft')::int as drafts
+        from job_orders where tenant_id = ${req.user.tid}`
+      // marcações de hoje + em atraso
+      const [book] = await tx`
+        select count(*)::int as n from job_orders
+        where tenant_id = ${req.user.tid} and status = 'draft'
+          and booking_date is not null and coalesce(booking_status,'') <> 'cancelled'
+          and booking_date::date <= current_date`
+      // diagnósticos à espera de autorização (que não submeti eu)
+      const [auth] = await tx`
+        select count(*)::int as n from job_orders
+        where tenant_id = ${req.user.tid} and status = 'diagnosis_review'
+          and (diag_submitted_by is null or diag_submitted_by <> ${req.user.sub})`
+      // entregues hoje
+      const [del] = await tx`
+        select count(*)::int as n from job_orders
+        where tenant_id = ${req.user.tid} and status = 'delivered'
+          and updated_at::date = current_date`
+      return {
+        inShop: counts?.in_shop || 0,
+        diagnosing: counts?.diagnosing || 0,
+        working: counts?.working || 0,
+        ready: counts?.ready || 0,
+        drafts: counts?.drafts || 0,
+        bookingsToday: book?.n || 0,
+        pendingAuth: auth?.n || 0,
+        deliveredToday: del?.n || 0,
+      }
+    })
+  })
+
   // ── Logs de erro recentes (só dono) — diagnóstico ───────────
   app.get('/error-logs', { preHandler: [guard('jobdelete:any')] }, async (req: any) => {
     return withTenant(req.user.tid, async (tx) => {
