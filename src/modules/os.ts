@@ -101,10 +101,17 @@ export async function osRoutes(app: FastifyInstance) {
     const { joId } = req.params
     try {
       return await withTenant(req.user.tid, async (tx) => {
-        const [jo] = await tx`select id, number, status, intentions, os_opened_at from job_orders where id = ${joId}`
+        const [jo] = await tx`select id, number, status, intentions, os_opened_at, entry_pending_reason, entry_completed_at from job_orders where id = ${joId}`
         if (!jo) return reply.code(404).send({ error: 'Recepção não encontrada' })
         if (jo.os_opened_at) return reply.code(409).send({ error: 'OS já foi iniciada' })
         if (jo.status === 'draft') return reply.code(400).send({ error: 'Recepção ainda é rascunho' })
+        // Portão: a entrada podia fechar sem o KM (o cliente não espera pela
+        // bateria), mas o carro não avança para OS sem isso resolvido.
+        if (jo.entry_pending_reason && !jo.entry_completed_at)
+          return reply.code(409).send({
+            error: 'Entrada incompleta: falta o KM e as fotos do painel. Completa a entrada antes de iniciar a OS.',
+            code: 'ENTRY_INCOMPLETE',
+          })
 
         // puxa as queixas do cliente como problemas iniciais
         const intentions = typeof jo.intentions === 'string' ? JSON.parse(jo.intentions) : (jo.intentions || [])
@@ -232,6 +239,33 @@ export async function osRoutes(app: FastifyInstance) {
   // ── Submeter diagnóstico ────────────────────────────────────
   // Se a autorização está ligada → vai para diagnosis_review (Edgar).
   // Se está desligada → avança direto para awaiting_quote.
+  // ── RETIRAR A SUBMISSÃO DO DIAGNÓSTICO ─────────────────────
+  // Submeter tranca a lista de problemas — e bem: não se muda o que
+  // está a ser autorizado nas costas de quem autoriza. Mas quem submeteu
+  // por engano (ou com um duplicado) ficava preso à espera de outra
+  // pessoa recusar. Aqui puxa de volta o que é seu, enquanto ninguém agiu.
+  app.post('/os/:joId/withdraw-diagnosis', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+    const { joId } = req.params
+    return withTenant(req.user.tid, async (tx) => {
+      const [jo] = await tx`
+        select id, number, status, diag_submitted_by from job_orders
+        where id = ${joId} and tenant_id = ${req.user.tid}`
+      if (!jo) return reply.code(404).send({ error: 'OS não encontrada' })
+      if (jo.status !== 'diagnosis_review')
+        return reply.code(409).send({ error: 'O diagnóstico não está à espera de autorização.' })
+      if (jo.diag_submitted_by !== req.user.sub)
+        return reply.code(403).send({ error: 'Só quem submeteu pode retirar a submissão.' })
+
+      await tx`
+        update job_orders set status = 'in_diagnosis',
+          diag_submitted_by = null, diag_submitted_at = null, updated_at = now()
+        where id = ${joId}`
+      await logState(tx, req.user.tid, joId, 'diagnosis_review', 'in_diagnosis', req.user.sub)
+      await audit(tx, req.user.tid, req.user.sub, 'os.diagnosis_withdraw', 'job_order', joId, { number: jo.number })
+      return reply.send({ ok: true })
+    })
+  })
+
   app.post('/os/:joId/submit-diagnosis', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
     const { joId } = req.params
     const notes = String((req.body as any).notes || '')

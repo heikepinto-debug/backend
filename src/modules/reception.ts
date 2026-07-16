@@ -38,8 +38,11 @@ const ReceptionSchema = z.object({
     model: z.string().optional(),
     year: z.number().int().optional(),
     color: z.string().optional(),
+    vin: z.string().optional(),               // identidade permanente do carro
   }),
-  kmEntry: z.number().int().min(0),
+  isNonRunner: z.boolean().default(false),    // entrou sem funcionar
+  kmEntry: z.number().int().min(0).optional(),          // pode ficar pendente (bateria em baixo)
+  entryPendingReason: z.string().min(3).optional(),    // porquê — obrigatório se o KM ficar por registar
   fuelLevel: z.number().int().min(0).max(8),
   reportedIssues: z.string().optional(),
   declaredValuables: z.string().min(1),        // obrigatório — mesmo "nenhum"
@@ -82,7 +85,9 @@ const DraftSchema = z.object({
     model: z.string().optional(),
     year: z.number().int().optional(),
     color: z.string().optional(),
+    vin: z.string().optional(),               // identidade permanente do carro
   }),
+  isNonRunner: z.boolean().default(false),    // entrou sem funcionar
   kmEntry: z.number().int().min(0).optional(),
   fuelLevel: z.number().int().min(0).max(8).optional(),
   declaredValuables: z.string().optional(),
@@ -167,11 +172,13 @@ export async function receptionRoutes(app: FastifyInstance) {
       if (!vehicleId) {
         const plate = d.vehicle.plate.toUpperCase().trim()
         const [v] = await tx`
-          insert into vehicles (tenant_id, customer_id, plate, brand, model, year, color)
+          insert into vehicles (tenant_id, customer_id, plate, brand, model, year, color, vin)
           values (${req.user.tid}, ${customerId}, ${plate},
                   ${d.vehicle.brand || null}, ${d.vehicle.model || null},
-                  ${d.vehicle.year || null}, ${d.vehicle.color || null})
-          on conflict (tenant_id, plate) do update set customer_id = ${customerId}
+                  ${d.vehicle.year || null}, ${d.vehicle.color || null},
+                  ${d.vehicle.vin || null})
+          on conflict (tenant_id, plate) do update set customer_id = ${customerId},
+            vin = coalesce(excluded.vin, vehicles.vin)
           returning id`
         vehicleId = v.id
       }
@@ -216,7 +223,8 @@ export async function receptionRoutes(app: FastifyInstance) {
           declared_valuables, checklist, damage_zones,
           battery_reference, systems_check, wants_old_parts,
           intentions, service_description, priority, estimated_delivery,
-          booking_date, received_by, offline_id, terms_version, terms_accepted_at
+          booking_date, received_by, offline_id, terms_version, terms_accepted_at,
+          is_non_runner, non_runner_accepted_at, entry_pending_reason
         ) values (
           ${req.user.tid}, ${d.businessUnitId}, ${number}, ${customerId}, ${vehicleId},
           'awaiting_diagnosis', ${d.source}, ${d.kmEntry}, ${d.fuelLevel},
@@ -225,7 +233,9 @@ export async function receptionRoutes(app: FastifyInstance) {
           ${d.batteryReference || null}, ${JSON.stringify(d.systemsCheck)}, ${d.wantsOldParts ?? null},
           ${JSON.stringify(d.intentions)}, ${d.serviceDescription || null}, ${d.priority},
           ${d.estimatedDelivery || null}, ${d.bookingDate || null}, ${req.user.sub}, ${d.offlineId || null},
-          ${d.termsVersion}, ${d.termsAcceptedAt}
+          ${d.termsVersion}, ${d.termsAcceptedAt},
+          ${d.isNonRunner}, ${d.isNonRunner ? new Date().toISOString() : null},
+          ${d.entryPendingReason || null}
         ) returning id, number`
 
       await audit(tx, req.user.tid, req.user.sub, 'reception.create', 'job_order', jo.id, {
@@ -259,9 +269,10 @@ export async function receptionRoutes(app: FastifyInstance) {
       if (!vehicleId) {
         const plate = d.vehicle.plate.toUpperCase().trim()
         const [v] = await tx`
-          insert into vehicles (tenant_id, customer_id, plate, brand, model, year)
-          values (${req.user.tid}, ${customerId}, ${plate}, ${d.vehicle.brand || null}, ${d.vehicle.model || null}, ${d.vehicle.year || null})
-          on conflict (tenant_id, plate) do update set customer_id = ${customerId}
+          insert into vehicles (tenant_id, customer_id, plate, brand, model, year, vin)
+          values (${req.user.tid}, ${customerId}, ${plate}, ${d.vehicle.brand || null}, ${d.vehicle.model || null}, ${d.vehicle.year || null}, ${d.vehicle.vin || null})
+          on conflict (tenant_id, plate) do update set customer_id = ${customerId},
+            vin = coalesce(excluded.vin, vehicles.vin)
           returning id`
         vehicleId = v.id
       }
@@ -492,6 +503,7 @@ export async function receptionRoutes(app: FastifyInstance) {
       const rows = await tx`
         select jo.id, jo.number, jo.status, jo.priority, jo.source,
                jo.km_entry, jo.received_at, jo.signed_at, jo.deletion_status,
+               jo.is_non_runner, jo.entry_pending_reason, jo.entry_completed_at,
                jo.deletion_reason,
                jo.priority_level, jo.priority_reason, jo.priority_rank,
                jo.os_opened_at,
@@ -698,13 +710,65 @@ export async function receptionRoutes(app: FastifyInstance) {
     })
   })
 
+  // ── COMPLETAR ENTRADA (KM + painel que ficaram pendentes) ──
+  // A entrada fechou e assinou sem o KM porque o carro não ligava.
+  // Aqui completa-se o que faltava. As fotos do painel sobem pelo
+  // caminho normal das fotos; isto sela o número e marca como completa.
+  app.post('/receptions/:joId/complete-entry', { preHandler: [guard('reception:create')] }, async (req: any, reply) => {
+    const { joId } = req.params
+    const body = z.object({ kmEntry: z.number().int().min(0) }).safeParse(req.body)
+    if (!body.success) return reply.code(400).send({ error: 'Quilometragem inválida' })
+
+    return withTenant(req.user.tid, async (tx) => {
+      const [jo] = await tx`
+        select id, entry_pending_reason, entry_completed_at from job_orders
+        where id = ${joId} and tenant_id = ${req.user.tid}`
+      if (!jo) return reply.code(404).send({ error: 'Entrada não encontrada' })
+      if (!jo.entry_pending_reason) return reply.code(409).send({ error: 'Esta entrada não tem nada pendente.' })
+      if (jo.entry_completed_at) return reply.code(409).send({ error: 'Entrada já foi completada.' })
+
+      // As três fotos do painel têm de estar lá — são o que exigia a ignição.
+      const [{ count }] = await tx`
+        select count(*) from reception_photos
+        where job_order_id = ${joId} and zone in ('dash_ign','dash_run','km')`
+      if (Number(count) < 3)
+        return reply.code(400).send({
+          error: `Faltam fotos do painel (${count} de 3). Tira as três antes de completar.`,
+        })
+
+      await tx`
+        update job_orders set km_entry = ${body.data.kmEntry},
+          entry_completed_at = now(), entry_completed_by = ${req.user.sub}
+        where id = ${joId}`
+      await audit(tx, req.user.tid, req.user.sub, 'reception.complete_entry', 'job_order', joId, {
+        km: body.data.kmEntry, motivo_original: jo.entry_pending_reason,
+      })
+      return reply.send({ ok: true })
+    })
+  })
+
   // ── TERMOS ACTIVOS (para o tablet mostrar) ─────────────────
   app.get('/terms/active', { preHandler: [guard('reception:read')] }, async (req: any) => {
     return withTenant(req.user.tid, async (tx) => {
       const [t] = await tx`
         select version, content, parking_fee, parking_grace_days,
                quote_approval_days, pickup_days, advance_threshold, advance_percent
-        from terms_versions where active order by created_at desc limit 1`
+        from terms_versions
+        where active and kind = 'geral'
+        order by created_at desc limit 1`
+      return t || null
+    })
+  })
+
+  // ── TERMOS POR TIPO (non_runner, dyno, marcacao...) ────────
+  // Os textos vivem como dados: mudá-los é editar a linha, não fazer deploy.
+  app.get('/terms/:kind', { preHandler: [guard('reception:read')] }, async (req: any) => {
+    const kind = String(req.params.kind || '').trim()
+    return withTenant(req.user.tid, async (tx) => {
+      const [t] = await tx`
+        select version, content from terms_versions
+        where active and kind = ${kind}
+        order by created_at desc limit 1`
       return t || null
     })
   })

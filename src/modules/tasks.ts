@@ -109,6 +109,58 @@ export async function taskRoutes(app: FastifyInstance) {
     })
   })
 
+  // ── Editar uma tarefa ───────────────────────────────────────
+  // Regras: edita quem criou (assigned_by) ou a Direcção.
+  // Só enquanto NÃO estiver concluída. Qualquer campo é editável.
+  app.patch('/tasks/:id', { preHandler: [(app as any).auth] }, async (req: any, reply) => {
+    const { id } = req.params
+    const body = TaskSchema.partial().safeParse(req.body)
+    if (!body.success) return reply.code(400).send({ error: 'Dados inválidos', details: body.error.flatten() })
+    const d = body.data
+    const isOwner = can(req.user.perms, 'jobdelete:any')
+
+    return withTenant(req.user.tid, async (tx) => {
+      const [t] = await tx`select assigned_by, assigned_to, status, is_personal from tasks where id = ${id}`
+      if (!t) return reply.code(404).send({ error: 'Tarefa não encontrada' })
+      if (t.status === 'done')
+        return reply.code(409).send({ error: 'Tarefa concluída — já não pode ser editada.' })
+      if (!isOwner && t.assigned_by !== req.user.sub)
+        return reply.code(403).send({ error: 'Só quem criou a tarefa (ou a Direcção) a pode editar.' })
+
+      // Se muda o responsável, valida a hierarquia como na criação.
+      let isSelf = t.is_personal
+      if (d.assignedTo && d.assignedTo !== t.assigned_to) {
+        isSelf = d.assignedTo === req.user.sub
+        if (!isSelf) {
+          const myLvl = await myLevel(tx, req.user.sub)
+          const targetLvl = await myLevel(tx, d.assignedTo)
+          if (targetLvl <= myLvl)
+            return reply.code(403).send({ error: 'Só podes atribuir tarefas a quem está abaixo de ti na equipa.' })
+        }
+      }
+      // O peso continua a ser só do dono.
+      const weight = (d.weight !== undefined && isOwner) ? d.weight : null
+
+      await tx`
+        update tasks set
+          title = coalesce(${d.title ?? null}, title),
+          description = coalesce(${d.description ?? null}, description),
+          assigned_to = coalesce(${d.assignedTo ?? null}, assigned_to),
+          is_personal = coalesce(${d.assignedTo ? isSelf : null}, is_personal),
+          due_date = coalesce(${d.dueDate ?? null}, due_date),
+          priority = coalesce(${d.priority ?? null}, priority),
+          weight = coalesce(${weight}, weight),
+          job_order_id = coalesce(${d.jobOrderId ?? null}, job_order_id),
+          requires_confirmation = coalesce(${d.requiresConfirmation ?? null}, requires_confirmation),
+          requires_attachment = coalesce(${d.requiresAttachment ?? null}, requires_attachment),
+          recurrence = coalesce(${d.recurrence ?? null}, recurrence),
+          recurrence_end = coalesce(${d.recurrenceEnd ?? null}, recurrence_end)
+        where id = ${id}`
+      await audit(tx, req.user.tid, req.user.sub, 'task.edit', 'task', id, { campos: Object.keys(d) })
+      return reply.send({ ok: true })
+    })
+  })
+
   // ── As minhas tarefas + as que atribuí ──────────────────────
   app.get('/tasks', { preHandler: [(app as any).auth] }, async (req: any) => {
     return withTenant(req.user.tid, async (tx) => {
