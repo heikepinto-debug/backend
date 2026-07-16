@@ -88,6 +88,7 @@ const DraftSchema = z.object({
     vin: z.string().optional(),               // identidade permanente do carro
   }),
   isNonRunner: z.boolean().default(false),    // entrou sem funcionar
+  entryPendingReason: z.string().min(3).optional(),   // km/painel por registar
   kmEntry: z.number().int().min(0).optional(),
   fuelLevel: z.number().int().min(0).max(8).optional(),
   declaredValuables: z.string().optional(),
@@ -198,6 +199,9 @@ export async function receptionRoutes(app: FastifyInstance) {
               checklist = ${JSON.stringify(d.checklist)}, damage_zones = ${JSON.stringify(d.damageZones)},
               battery_reference = ${d.batteryReference || null}, systems_check = ${JSON.stringify(d.systemsCheck)},
               wants_old_parts = ${d.wantsOldParts ?? null},
+              is_non_runner = ${d.isNonRunner},
+              non_runner_accepted_at = ${d.isNonRunner ? new Date().toISOString() : null},
+              entry_pending_reason = ${d.entryPendingReason || null},
               intentions = ${JSON.stringify(d.intentions)}, service_description = ${d.serviceDescription || null},
               priority = ${d.priority}, booking_date = ${d.bookingDate || null},
               received_by = ${req.user.sub}, received_at = now(),
@@ -284,11 +288,13 @@ export async function receptionRoutes(app: FastifyInstance) {
           await tx`
             update job_orders set
               business_unit_id = ${d.businessUnitId}, customer_id = ${customerId}, vehicle_id = ${vehicleId},
-              source = ${d.source}, km_entry = ${d.kmEntry ?? 0}, fuel_level = ${d.fuelLevel ?? 4},
+              source = ${d.source}, km_entry = ${d.kmEntry ?? null}, fuel_level = ${d.fuelLevel ?? 4},
               declared_valuables = ${d.declaredValuables || ''},
               checklist = ${JSON.stringify(d.checklist)}, damage_zones = ${JSON.stringify(d.damageZones)},
               battery_reference = ${d.batteryReference || null}, systems_check = ${JSON.stringify(d.systemsCheck)},
               wants_old_parts = ${d.wantsOldParts ?? null},
+              is_non_runner = ${d.isNonRunner ?? false},
+              entry_pending_reason = ${d.entryPendingReason || null},
               intentions = ${JSON.stringify(d.intentions)}, service_description = ${d.serviceDescription || null},
               booking_date = ${d.bookingDate || null}, updated_at = now()
             where id = ${d.draftId}`
@@ -301,12 +307,14 @@ export async function receptionRoutes(app: FastifyInstance) {
           tenant_id, business_unit_id, number, customer_id, vehicle_id, status, source,
           km_entry, fuel_level, declared_valuables, checklist, damage_zones,
           battery_reference, systems_check, wants_old_parts,
+          is_non_runner, entry_pending_reason,
           intentions, service_description, booking_date, draft_created_by, draft_created_at
         ) values (
           ${req.user.tid}, ${d.businessUnitId}, ${number}, ${customerId}, ${vehicleId}, 'draft', ${d.source},
-          ${d.kmEntry ?? 0}, ${d.fuelLevel ?? 4}, ${d.declaredValuables || ''},
+          ${d.kmEntry ?? null}, ${d.fuelLevel ?? 4}, ${d.declaredValuables || ''},
           ${JSON.stringify(d.checklist)}, ${JSON.stringify(d.damageZones)},
           ${d.batteryReference || null}, ${JSON.stringify(d.systemsCheck)}, ${d.wantsOldParts ?? null},
+          ${d.isNonRunner ?? false}, ${d.entryPendingReason || null},
           ${JSON.stringify(d.intentions)}, ${d.serviceDescription || null}, ${d.bookingDate || null},
           ${req.user.sub}, now()
         ) returning id, number`
@@ -328,7 +336,17 @@ export async function receptionRoutes(app: FastifyInstance) {
         join vehicles v on v.id = j.vehicle_id
         where j.id = ${joId}`
       if (!jo) return reply.code(404).send({ error: 'Rascunho não encontrado' })
-      return reply.send({ data: jo })
+
+      // Fotos já carregadas neste rascunho. Sem isto, quem retoma não sabe
+      // o que já fez e volta a fotografar tudo (ou perde o trabalho todo).
+      const photos = await tx`
+        select id, zone, storage_path, is_required from reception_photos
+        where job_order_id = ${joId}`
+      const comUrl = await Promise.all(photos.map(async (p: any) => {
+        const { data } = await supabase.storage.from(BUCKET).createSignedUrl(p.storage_path, 3600)
+        return { id: p.id, zone: p.zone, isRequired: p.is_required, url: data?.signedUrl || null }
+      }))
+      return reply.send({ data: jo, photos: comUrl })
     })
   })
 
@@ -371,6 +389,18 @@ export async function receptionRoutes(app: FastifyInstance) {
 
       // Regista metadados imediatamente (a foto chega directo ao Storage)
       return withTenant(req.user.tid, async (tx) => {
+        // Uma zona = uma foto. Se já houver foto nesta zona (rascunho retomado
+        // e refotografado), a nova substitui — senão acumulavam-se duplicados
+        // e o retomar não saberia qual mostrar.
+        const antigas = await tx`
+          select id, storage_path from reception_photos
+          where job_order_id = ${joId} and zone = ${d.zone}`
+        if (antigas.length) {
+          await tx`delete from reception_photos where job_order_id = ${joId} and zone = ${d.zone}`
+          // Limpa também o ficheiro, para não deixar lixo no Storage.
+          const paths = antigas.map((a: any) => a.storage_path).filter(Boolean)
+          if (paths.length) await supabase.storage.from(BUCKET).remove(paths).catch(() => {})
+        }
         const [photo] = await tx`
           insert into reception_photos
             (tenant_id, job_order_id, zone, is_required, storage_path,
