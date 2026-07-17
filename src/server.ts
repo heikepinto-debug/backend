@@ -26,10 +26,13 @@ app.setErrorHandler(async (error, req, reply) => {
       const u: any = (req as any).user || {}
       // rota sem query string (evita vazar dados sensíveis nos parâmetros)
       const route = (req.url || '').split('?')[0]
+      // Versão do cliente: sem isto não se sabe que código gerou o erro,
+      // e um telemóvel preso numa versão antiga passa despercebido.
+      const appVer = String((req.headers as any)['x-app-version'] || '').slice(0, 40) || null
       await sql`
-        insert into error_logs (tenant_id, user_id, method, route, status_code, message, error_code)
+        insert into error_logs (tenant_id, user_id, method, route, status_code, message, error_code, app_version)
         values (${u.tid || null}, ${u.sub || null}, ${req.method || null}, ${route || null},
-                ${status}, ${(error.message || '').slice(0, 500)}, ${(error as any).code || null})`
+                ${status}, ${(error.message || '').slice(0, 500)}, ${(error as any).code || null}, ${appVer})`
     } catch { /* nunca deixar o logging rebentar a resposta */ }
   }
 

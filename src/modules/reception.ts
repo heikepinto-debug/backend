@@ -104,6 +104,11 @@ const DraftSchema = z.object({
   bookingDate: z.string().optional(),
 })
 
+// Normaliza a matrícula para comparação: só letras e números, maiúsculas.
+// ABC-123-MP, ABC 123 MP e abc123mp são o mesmo carro. Espelha a coluna
+// gerada plate_norm (migration 0023) — se uma mudar, muda a outra.
+const normPlate = (p: string) => (p || '').toUpperCase().replace(/[^A-Z0-9]/g, '')
+
 export async function receptionRoutes(app: FastifyInstance) {
 
   // ── CLIENTES ────────────────────────────────────────────────
@@ -172,16 +177,33 @@ export async function receptionRoutes(app: FastifyInstance) {
       let vehicleId = d.vehicle.id
       if (!vehicleId) {
         const plate = d.vehicle.plate.toUpperCase().trim()
-        const [v] = await tx`
-          insert into vehicles (tenant_id, customer_id, plate, brand, model, year, color, vin)
-          values (${req.user.tid}, ${customerId}, ${plate},
-                  ${d.vehicle.brand || null}, ${d.vehicle.model || null},
-                  ${d.vehicle.year || null}, ${d.vehicle.color || null},
-                  ${d.vehicle.vin || null})
-          on conflict (tenant_id, plate) do update set customer_id = ${customerId},
-            vin = coalesce(excluded.vin, vehicles.vin)
-          returning id`
-        vehicleId = v.id
+        // Procura pelo formato normalizado: o mesmo carro escrito com ou sem
+        // hífens é o mesmo carro, e tem de cair na mesma ficha.
+        const [existente] = await tx`
+          select id from vehicles
+          where tenant_id = ${req.user.tid} and plate_norm = ${normPlate(plate)}
+          limit 1`
+        if (existente) {
+          await tx`
+            update vehicles set customer_id = ${customerId},
+              vin = coalesce(${d.vehicle.vin || null}, vin),
+              brand = coalesce(brand, ${d.vehicle.brand || null}),
+              model = coalesce(model, ${d.vehicle.model || null}),
+              color = coalesce(color, ${d.vehicle.color || null})
+            where id = ${existente.id}`
+          vehicleId = existente.id
+        } else {
+          const [v] = await tx`
+            insert into vehicles (tenant_id, customer_id, plate, brand, model, year, color, vin)
+            values (${req.user.tid}, ${customerId}, ${plate},
+                    ${d.vehicle.brand || null}, ${d.vehicle.model || null},
+                    ${d.vehicle.year || null}, ${d.vehicle.color || null},
+                    ${d.vehicle.vin || null})
+            on conflict (tenant_id, plate) do update set customer_id = ${customerId},
+              vin = coalesce(excluded.vin, vehicles.vin)
+            returning id`
+          vehicleId = v.id
+        }
       }
       if (!vehicleId) return reply.code(400).send({ error: 'Viatura inválida' })
 
@@ -272,13 +294,23 @@ export async function receptionRoutes(app: FastifyInstance) {
       let vehicleId = d.vehicle.id
       if (!vehicleId) {
         const plate = d.vehicle.plate.toUpperCase().trim()
-        const [v] = await tx`
-          insert into vehicles (tenant_id, customer_id, plate, brand, model, year, vin)
-          values (${req.user.tid}, ${customerId}, ${plate}, ${d.vehicle.brand || null}, ${d.vehicle.model || null}, ${d.vehicle.year || null}, ${d.vehicle.vin || null})
-          on conflict (tenant_id, plate) do update set customer_id = ${customerId},
-            vin = coalesce(excluded.vin, vehicles.vin)
-          returning id`
-        vehicleId = v.id
+        const [existente] = await tx`
+          select id from vehicles
+          where tenant_id = ${req.user.tid} and plate_norm = ${normPlate(plate)}
+          limit 1`
+        if (existente) {
+          await tx`update vehicles set customer_id = ${customerId},
+            vin = coalesce(${d.vehicle.vin || null}, vin) where id = ${existente.id}`
+          vehicleId = existente.id
+        } else {
+          const [v] = await tx`
+            insert into vehicles (tenant_id, customer_id, plate, brand, model, year, vin)
+            values (${req.user.tid}, ${customerId}, ${plate}, ${d.vehicle.brand || null}, ${d.vehicle.model || null}, ${d.vehicle.year || null}, ${d.vehicle.vin || null})
+            on conflict (tenant_id, plate) do update set customer_id = ${customerId},
+              vin = coalesce(excluded.vin, vehicles.vin)
+            returning id`
+          vehicleId = v.id
+        }
       }
 
       // Actualiza rascunho existente ou cria novo
@@ -451,12 +483,19 @@ export async function receptionRoutes(app: FastifyInstance) {
         // Validação de integridade: exige as fotos obrigatórias antes de selar.
         // O frontend já garante todas as fotos; isto é uma rede de segurança
         // contra selar uma JO sem fotos nenhumas.
+        // Uma JO não sela sem as fotos obrigatórias. O limite era 9 (rede de
+        // segurança mínima) e isso deixou passar a JO-2026-0019 com 11 de 14:
+        // até cinco podiam faltar sem ninguém saber. Agora exigem-se as 14 —
+        // ou 11, se a entrada ficou pendente (as 3 do painel exigem ignição).
         const [{ count }] = await tx`
           select count(*) from reception_photos
           where job_order_id = ${joId} and is_required = true`
-        if (Number(count) < 9)
+        const [joInfo] = await tx`select entry_pending_reason from job_orders where id = ${joId}`
+        const minimo = joInfo?.entry_pending_reason ? 11 : 14
+        if (Number(count) < minimo)
           return reply.code(422).send({
-            error: `Só ${count} fotos obrigatórias — a JO não pode ser selada sem elas`,
+            error: `Faltam fotos obrigatórias: ${count} de ${minimo}. A entrada não pode ser selada sem elas.`,
+            code: 'FOTOS_EM_FALTA',
           })
 
         await tx`
@@ -529,11 +568,15 @@ export async function receptionRoutes(app: FastifyInstance) {
     const q = req.query as any
     const search = String(q.search || '').trim()
     const like = search ? `%${search}%` : null
+    const sn = normPlate(search)
+    const likeNorm = sn ? `%${sn}%` : null
     return withTenant(req.user.tid, async (tx) => {
       const rows = await tx`
         select jo.id, jo.number, jo.status, jo.priority, jo.source,
                jo.km_entry, jo.received_at, jo.signed_at, jo.deletion_status,
                jo.is_non_runner, jo.entry_pending_reason, jo.entry_completed_at,
+               (select count(*) from reception_photos rp
+                where rp.job_order_id = jo.id and rp.is_required = true) as req_photos,
                jo.deletion_reason,
                jo.priority_level, jo.priority_reason, jo.priority_rank,
                jo.os_opened_at,
@@ -551,6 +594,7 @@ export async function receptionRoutes(app: FastifyInstance) {
           and (${q.status || null}::text is null or jo.status = ${q.status || null})
           and (${like}::text is null
                or v.plate ilike ${like}
+               or v.plate_norm like ${likeNorm}
                or c.full_name ilike ${like}
                or jo.number ilike ${like})
         order by jo.received_at desc
@@ -768,7 +812,7 @@ export async function receptionRoutes(app: FastifyInstance) {
   // caminho normal das fotos; isto sela o número e marca como completa.
   app.post('/receptions/:joId/complete-entry', { preHandler: [guard('reception:create')] }, async (req: any, reply) => {
     const { joId } = req.params
-    const body = z.object({ kmEntry: z.number().int().min(0) }).safeParse(req.body)
+    const body = z.object({ kmEntry: z.number().int().min(0).optional() }).safeParse(req.body)
     if (!body.success) return reply.code(400).send({ error: 'Quilometragem inválida' })
 
     return withTenant(req.user.tid, async (tx) => {
@@ -776,8 +820,11 @@ export async function receptionRoutes(app: FastifyInstance) {
         select id, entry_pending_reason, entry_completed_at from job_orders
         where id = ${joId} and tenant_id = ${req.user.tid}`
       if (!jo) return reply.code(404).send({ error: 'Entrada não encontrada' })
-      if (!jo.entry_pending_reason) return reply.code(409).send({ error: 'Esta entrada não tem nada pendente.' })
       if (jo.entry_completed_at) return reply.code(409).send({ error: 'Entrada já foi completada.' })
+      // Não exige entry_pending_reason: uma entrada pode ter ficado sem as
+      // fotos do painel por outra razão que não a bateria (versão antiga da
+      // app, envio interrompido). Se faltam fotos obrigatórias, tem de haver
+      // caminho para as pôr — senão o registo fica coxo para sempre.
 
       // As três fotos do painel têm de estar lá — são o que exigia a ignição.
       const [{ count }] = await tx`
@@ -789,7 +836,8 @@ export async function receptionRoutes(app: FastifyInstance) {
         })
 
       await tx`
-        update job_orders set km_entry = ${body.data.kmEntry},
+        update job_orders set
+          km_entry = coalesce(${body.data.kmEntry ?? null}, km_entry),
           entry_completed_at = now(), entry_completed_by = ${req.user.sub}
         where id = ${joId}`
       await audit(tx, req.user.tid, req.user.sub, 'reception.complete_entry', 'job_order', joId, {
