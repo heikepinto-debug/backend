@@ -704,14 +704,16 @@ export async function receptionRoutes(app: FastifyInstance) {
     const { joId } = req.params
     return withTenant(req.user.tid, async (tx) => {
       const [jo] = await tx`
-        select jo.*, v.plate, v.brand, v.model, v.year, v.color,
+        select jo.*, v.plate, v.brand, v.model, v.year, v.color, v.vin,
                c.full_name as customer_name, c.phone as customer_phone,
                u.full_name as received_by_name,
                ub.full_name as draft_created_by_name,
-               ur.full_name as deletion_requested_by_name
+               ur.full_name as deletion_requested_by_name,
+               uc.full_name as entry_completed_by_name
         from job_orders jo
         join vehicles v on v.id = jo.vehicle_id
         join customers c on c.id = jo.customer_id
+        left join users uc on uc.id = jo.entry_completed_by
         left join users u on u.id = jo.received_by
         left join users ub on ub.id = jo.draft_created_by
         left join users ur on ur.id = jo.deletion_requested_by
@@ -736,7 +738,27 @@ export async function receptionRoutes(app: FastifyInstance) {
         signatureUrl = data?.signedUrl
       }
 
-      return { ...jo, photos: withUrls, signatureViewUrl: signatureUrl }
+      // Outras visitas do mesmo carro. É a semente da ficha viva do veículo:
+      // quem abre um carro passa a ver o que já lá foi feito, sem procurar.
+      const historico = await tx`
+        select h.id, h.number, h.status, h.received_at, h.km_entry, h.intentions,
+               h.os_opened_at, h.signed_at
+        from job_orders h
+        where h.tenant_id = ${req.user.tid}
+          and h.vehicle_id = ${jo.vehicle_id}
+          and h.id <> ${joId}
+          and h.status <> 'cancelled'
+        order by coalesce(h.received_at, h.created_at) desc
+        limit 20`
+
+      // Documento de identificação: está guardado desde sempre e nunca foi
+      // mostrado em lado nenhum. Faz parte do que se registou à entrada.
+      let idDocUrl = null
+      if (jo.id_document_path) {
+        const { data } = await supabase.storage.from(BUCKET).createSignedUrl(jo.id_document_path, 3600)
+        idDocUrl = data?.signedUrl || null
+      }
+      return { ...jo, photos: withUrls, signatureViewUrl: signatureUrl, idDocViewUrl: idDocUrl, historico }
     })
   })
 
