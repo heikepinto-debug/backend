@@ -252,15 +252,15 @@ export async function receptionRoutes(app: FastifyInstance) {
           booking_date, received_by, offline_id, terms_version, terms_accepted_at,
           is_non_runner, non_runner_accepted_at, entry_pending_reason
         ) values (
-          ${req.user.tid}, ${d.businessUnitId}, ${number}, ${customerId}, ${vehicleId},
-          'awaiting_diagnosis', ${d.source}, ${d.kmEntry}, ${d.fuelLevel},
-          ${d.reportedIssues || null}, ${d.declaredValuables},
-          ${JSON.stringify(d.checklist)}, ${JSON.stringify(d.damageZones)},
-          ${d.batteryReference || null}, ${JSON.stringify(d.systemsCheck)}, ${d.wantsOldParts ?? null},
-          ${JSON.stringify(d.intentions)}, ${d.serviceDescription || null}, ${d.priority},
+          ${req.user.tid}, ${d.businessUnitId ?? null}, ${number}, ${customerId}, ${vehicleId},
+          'awaiting_diagnosis', ${d.source ?? 'walkin'}, ${d.kmEntry ?? null}, ${d.fuelLevel ?? null},
+          ${d.reportedIssues || null}, ${d.declaredValuables ?? ''},
+          ${JSON.stringify(d.checklist ?? {})}, ${JSON.stringify(d.damageZones ?? [])},
+          ${d.batteryReference || null}, ${JSON.stringify(d.systemsCheck ?? {})}, ${d.wantsOldParts ?? null},
+          ${JSON.stringify(d.intentions ?? [])}, ${d.serviceDescription || null}, ${d.priority ?? 'normal'},
           ${d.estimatedDelivery || null}, ${d.bookingDate || null}, ${req.user.sub}, ${d.offlineId || null},
-          ${d.termsVersion}, ${d.termsAcceptedAt},
-          ${d.isNonRunner}, ${d.isNonRunner ? new Date().toISOString() : null},
+          ${d.termsVersion ?? null}, ${d.termsAcceptedAt ?? null},
+          ${d.isNonRunner ?? false}, ${d.isNonRunner ? new Date().toISOString() : null},
           ${d.entryPendingReason || null}
         ) returning id, number`
 
