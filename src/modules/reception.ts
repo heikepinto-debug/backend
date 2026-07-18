@@ -950,7 +950,7 @@ export async function receptionRoutes(app: FastifyInstance) {
       try {
         // Reaproveitar a rota de criação via injecção interna
         const res = await app.inject({
-          method: 'POST', url: '/receptions',
+          method: 'POST', url: '/api/v1/receptions',
           headers: { authorization: req.headers.authorization },
           payload: { ...item.payload, offlineId: item.offlineId },
         })
