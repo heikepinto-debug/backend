@@ -12,9 +12,8 @@ import { withTenant, audit, can } from '../lib/core.js'
 
 function guard(perm: string) {
   return async (req: any, reply: any) => {
-    await (req.server as any).authenticate(req, reply)
-    if (!can(req.user.perms, perm))
-      return reply.code(403).send({ error: 'Sem permissão', needed: perm })
+    try { await req.jwtVerify() } catch { return reply.code(401).send({ error: 'Não autenticado' }) }
+    if (!can(req.user.perms, perm)) return reply.code(403).send({ error: 'Sem permissão', needed: perm })
   }
 }
 
