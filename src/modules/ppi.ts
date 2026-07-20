@@ -68,11 +68,21 @@ export async function ppiRoutes(app: FastifyInstance) {
         select id, level, status from ppi_inspections
         where job_order_id = ${jobOrderId} and tenant_id = ${req.user.tid} limit 1`
       if (existe) return reply.send(existe)
+      // Nível a partir do serviço PPI escolhido na entrada ("PPI — Standard").
+      // Se não der para inferir, usa o nível pedido (por omissão, standard).
+      const [svc] = await tx`
+        select type_name from job_services
+        where job_order_id = ${jobOrderId} and type_name ilike '%PPI%' limit 1`
+      let lvl = level
+      const nome = (svc?.type_name || '').toLowerCase()
+      if (nome.includes('premium')) lvl = 'premium'
+      else if (nome.includes('básico') || nome.includes('basico')) lvl = 'basic'
+      else if (nome.includes('standard')) lvl = 'standard'
       const [insp] = await tx`
         insert into ppi_inspections (tenant_id, job_order_id, level, started_by)
-        values (${req.user.tid}, ${jobOrderId}, ${level}, ${req.user.sub})
+        values (${req.user.tid}, ${jobOrderId}, ${lvl}, ${req.user.sub})
         returning id, level, status`
-      await audit(tx, req.user.tid, req.user.sub, 'ppi.start', 'ppi_inspection', insp.id, { level })
+      await audit(tx, req.user.tid, req.user.sub, 'ppi.start', 'ppi_inspection', insp.id, { level: lvl })
       return reply.send(insp)
     })
   })
