@@ -42,6 +42,7 @@ const ReceptionSchema = z.object({
   }),
   isNonRunner: z.boolean().default(false),    // entrou sem funcionar
   clientPresence: z.enum(['waits','leaves']).optional(),   // cliente espera/deixa (decidido à entrada)
+  entryType: z.enum(['full','quick']).default('full'),     // rápida = sem 14 fotos nem checklist
   kmEntry: z.number().int().min(0).optional(),          // pode ficar pendente (bateria em baixo)
   entryPendingReason: z.string().min(3).optional(),    // porquê — obrigatório se o KM ficar por registar
   fuelLevel: z.number().int().min(0).max(8),
@@ -276,7 +277,7 @@ export async function receptionRoutes(app: FastifyInstance) {
           battery_reference, systems_check, wants_old_parts,
           intentions, service_description, priority, estimated_delivery,
           booking_date, received_by, offline_id, terms_version, terms_accepted_at,
-          is_non_runner, non_runner_accepted_at, entry_pending_reason, client_presence
+          is_non_runner, non_runner_accepted_at, entry_pending_reason, client_presence, entry_type
         ) values (
           ${req.user.tid}, ${d.businessUnitId ?? null}, ${number}, ${customerId}, ${vehicleId},
           'awaiting_diagnosis', ${d.source ?? 'walkin'}, ${d.kmEntry ?? null}, ${d.fuelLevel ?? null},
@@ -287,7 +288,7 @@ export async function receptionRoutes(app: FastifyInstance) {
           ${d.estimatedDelivery || null}, ${d.bookingDate || null}, ${req.user.sub}, ${d.offlineId || null},
           ${d.termsVersion ?? null}, ${d.termsAcceptedAt ?? null},
           ${d.isNonRunner ?? false}, ${d.isNonRunner ? new Date().toISOString() : null},
-          ${d.entryPendingReason || null}, ${d.clientPresence || null}
+          ${d.entryPendingReason || null}, ${d.clientPresence || null}, ${d.entryType ?? 'full'}
         ) returning id, number`
 
       await syncJobServices(tx, req.user.tid, jo.id, req.user.sub, d.services)
@@ -525,13 +526,17 @@ export async function receptionRoutes(app: FastifyInstance) {
         const [{ count }] = await tx`
           select count(*) from reception_photos
           where job_order_id = ${joId} and is_required = true`
-        const [joInfo] = await tx`select entry_pending_reason from job_orders where id = ${joId}`
-        const minimo = joInfo?.entry_pending_reason ? 11 : 14
-        if (Number(count) < minimo)
-          return reply.code(422).send({
-            error: `Faltam fotos obrigatórias: ${count} de ${minimo}. A entrada não pode ser selada sem elas.`,
-            code: 'FOTOS_EM_FALTA',
-          })
+        const [joInfo] = await tx`select entry_pending_reason, entry_type from job_orders where id = ${joId}`
+        // Entrada rápida não tem as 14 fotos — é enxuta por desenho (PPI,
+        // diagnóstico, serviços rápidos). Só a completa exige o conjunto.
+        if (joInfo?.entry_type !== 'quick') {
+          const minimo = joInfo?.entry_pending_reason ? 11 : 14
+          if (Number(count) < minimo)
+            return reply.code(422).send({
+              error: `Faltam fotos obrigatórias: ${count} de ${minimo}. A entrada não pode ser selada sem elas.`,
+              code: 'FOTOS_EM_FALTA',
+            })
+        }
 
         await tx`
           update job_orders
@@ -609,7 +614,7 @@ export async function receptionRoutes(app: FastifyInstance) {
       const rows = await tx`
         select jo.id, jo.number, jo.status, jo.priority, jo.source,
                jo.km_entry, jo.received_at, jo.signed_at, jo.deletion_status,
-               jo.is_non_runner, jo.entry_pending_reason, jo.entry_completed_at,
+               jo.is_non_runner, jo.entry_pending_reason, jo.entry_completed_at, jo.entry_type,
                (select count(*) from reception_photos rp
                 where rp.job_order_id = jo.id and rp.is_required = true) as req_photos,
                jo.deletion_reason,
