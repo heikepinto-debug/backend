@@ -41,6 +41,7 @@ const ReceptionSchema = z.object({
     vin: z.string().optional(),               // identidade permanente do carro
   }),
   isNonRunner: z.boolean().default(false),    // entrou sem funcionar
+  clientPresence: z.enum(['waits','leaves']).optional(),   // cliente espera/deixa (decidido à entrada)
   kmEntry: z.number().int().min(0).optional(),          // pode ficar pendente (bateria em baixo)
   entryPendingReason: z.string().min(3).optional(),    // porquê — obrigatório se o KM ficar por registar
   fuelLevel: z.number().int().min(0).max(8),
@@ -93,6 +94,7 @@ const DraftSchema = z.object({
     vin: z.string().optional(),               // identidade permanente do carro
   }),
   isNonRunner: z.boolean().default(false),    // entrou sem funcionar
+  clientPresence: z.enum(['waits','leaves']).optional(),   // cliente espera/deixa (decidido à entrada)
   entryPendingReason: z.string().min(3).optional(),   // km/painel por registar
   kmEntry: z.number().int().min(0).optional(),
   fuelLevel: z.number().int().min(0).max(8).optional(),
@@ -246,6 +248,7 @@ export async function receptionRoutes(app: FastifyInstance) {
               is_non_runner = ${d.isNonRunner},
               non_runner_accepted_at = ${d.isNonRunner ? new Date().toISOString() : null},
               entry_pending_reason = ${d.entryPendingReason || null},
+              client_presence = ${d.clientPresence || null},
               intentions = ${JSON.stringify(d.intentions)}, service_description = ${d.serviceDescription || null},
               priority = ${d.priority}, booking_date = ${d.bookingDate || null},
               received_by = ${req.user.sub}, received_at = now(),
@@ -273,7 +276,7 @@ export async function receptionRoutes(app: FastifyInstance) {
           battery_reference, systems_check, wants_old_parts,
           intentions, service_description, priority, estimated_delivery,
           booking_date, received_by, offline_id, terms_version, terms_accepted_at,
-          is_non_runner, non_runner_accepted_at, entry_pending_reason
+          is_non_runner, non_runner_accepted_at, entry_pending_reason, client_presence
         ) values (
           ${req.user.tid}, ${d.businessUnitId ?? null}, ${number}, ${customerId}, ${vehicleId},
           'awaiting_diagnosis', ${d.source ?? 'walkin'}, ${d.kmEntry ?? null}, ${d.fuelLevel ?? null},
@@ -284,7 +287,7 @@ export async function receptionRoutes(app: FastifyInstance) {
           ${d.estimatedDelivery || null}, ${d.bookingDate || null}, ${req.user.sub}, ${d.offlineId || null},
           ${d.termsVersion ?? null}, ${d.termsAcceptedAt ?? null},
           ${d.isNonRunner ?? false}, ${d.isNonRunner ? new Date().toISOString() : null},
-          ${d.entryPendingReason || null}
+          ${d.entryPendingReason || null}, ${d.clientPresence || null}
         ) returning id, number`
 
       await syncJobServices(tx, req.user.tid, jo.id, req.user.sub, d.services)
@@ -352,6 +355,7 @@ export async function receptionRoutes(app: FastifyInstance) {
               wants_old_parts = ${d.wantsOldParts ?? null},
               is_non_runner = ${d.isNonRunner ?? false},
               entry_pending_reason = ${d.entryPendingReason || null},
+              client_presence = ${d.clientPresence || null},
               intentions = ${JSON.stringify(d.intentions)}, service_description = ${d.serviceDescription || null},
               booking_date = ${d.bookingDate || null}, updated_at = now()
             where id = ${d.draftId}`
@@ -365,14 +369,14 @@ export async function receptionRoutes(app: FastifyInstance) {
           tenant_id, business_unit_id, number, customer_id, vehicle_id, status, source,
           km_entry, fuel_level, declared_valuables, checklist, damage_zones,
           battery_reference, systems_check, wants_old_parts,
-          is_non_runner, entry_pending_reason,
+          is_non_runner, entry_pending_reason, client_presence,
           intentions, service_description, booking_date, draft_created_by, draft_created_at
         ) values (
           ${req.user.tid}, ${d.businessUnitId}, ${number}, ${customerId}, ${vehicleId}, 'draft', ${d.source},
           ${d.kmEntry ?? null}, ${d.fuelLevel ?? 4}, ${d.declaredValuables || ''},
           ${JSON.stringify(d.checklist)}, ${JSON.stringify(d.damageZones)},
           ${d.batteryReference || null}, ${JSON.stringify(d.systemsCheck)}, ${d.wantsOldParts ?? null},
-          ${d.isNonRunner ?? false}, ${d.entryPendingReason || null},
+          ${d.isNonRunner ?? false}, ${d.entryPendingReason || null}, ${d.clientPresence || null},
           ${JSON.stringify(d.intentions)}, ${d.serviceDescription || null}, ${d.bookingDate || null},
           ${req.user.sub}, now()
         ) returning id, number`
