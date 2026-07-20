@@ -617,6 +617,9 @@ export async function receptionRoutes(app: FastifyInstance) {
                jo.is_non_runner, jo.entry_pending_reason, jo.entry_completed_at, jo.entry_type,
                (select count(*) from reception_photos rp
                 where rp.job_order_id = jo.id and rp.is_required = true) as req_photos,
+               exists(select 1 from job_services js where js.job_order_id = jo.id
+                      and js.type_name ilike '%PPI%') as has_ppi,
+               (select i.id from ppi_inspections i where i.job_order_id = jo.id limit 1) as ppi_id,
                jo.deletion_reason,
                jo.priority_level, jo.priority_reason, jo.priority_rank,
                jo.os_opened_at,
