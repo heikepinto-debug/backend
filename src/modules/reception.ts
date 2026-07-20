@@ -58,6 +58,11 @@ const ReceptionSchema = z.object({
   // Intenção do cliente: várias, livres, sem trancar sector.
   // O serviço "a sério" define-se depois no diagnóstico.
   intentions: z.array(z.string().min(1)).min(1),   // ex: ['Barulho na frente','Quer Stage 2']
+  services: z.array(z.object({                     // serviços escolhidos (um ou vários)
+    serviceTypeId: z.string().uuid(),
+    typeName: z.string().min(1),
+    notes: z.string().optional(),
+  })).default([]),
   serviceDescription: z.string().optional(),        // notas gerais adicionais
   priority: z.enum(['normal','urgent']).default('normal'),
   estimatedDelivery: z.string().optional(),
@@ -100,6 +105,11 @@ const DraftSchema = z.object({
     id: z.string(), area: z.string(), note: z.string().optional(),
   })).default([]),
   intentions: z.array(z.string()).default([]),
+  services: z.array(z.object({
+    serviceTypeId: z.string().uuid(),
+    typeName: z.string().min(1),
+    notes: z.string().optional(),
+  })).default([]),
   serviceDescription: z.string().optional(),
   bookingDate: z.string().optional(),
 })
@@ -108,6 +118,18 @@ const DraftSchema = z.object({
 // ABC-123-MP, ABC 123 MP e abc123mp são o mesmo carro. Espelha a coluna
 // gerada plate_norm (migration 0023) — se uma mudar, muda a outra.
 const normPlate = (p: string) => (p || '').toUpperCase().replace(/[^A-Z0-9]/g, '')
+
+// Sincroniza os serviços de uma entrada. Copia o nome do tipo no momento
+// (type_name) para o histórico não mudar se o tipo for renomeado depois.
+// Recria a lista — usado ao criar e ao actualizar rascunho.
+async function syncJobServices(tx: any, tenantId: string, joId: string, userId: string, services: any[]) {
+  await tx`delete from job_services where job_order_id = ${joId}`
+  for (const s of (services || [])) {
+    await tx`
+      insert into job_services (tenant_id, job_order_id, service_type_id, type_name, notes, created_by)
+      values (${tenantId}, ${joId}, ${s.serviceTypeId || null}, ${s.typeName}, ${s.notes || null}, ${userId})`
+  }
+}
 
 export async function receptionRoutes(app: FastifyInstance) {
 
@@ -231,6 +253,7 @@ export async function receptionRoutes(app: FastifyInstance) {
               updated_at = now()
             where id = ${draftId}
             returning id, number, draft_created_by`
+          await syncJobServices(tx, req.user.tid, jo.id, req.user.sub, d.services)
           await audit(tx, req.user.tid, req.user.sub, 'reception.finalize_draft', 'job_order', jo.id, {
             number: jo.number, started_by: jo.draft_created_by, finalized_by: req.user.sub,
           })
@@ -263,6 +286,8 @@ export async function receptionRoutes(app: FastifyInstance) {
           ${d.isNonRunner ?? false}, ${d.isNonRunner ? new Date().toISOString() : null},
           ${d.entryPendingReason || null}
         ) returning id, number`
+
+      await syncJobServices(tx, req.user.tid, jo.id, req.user.sub, d.services)
 
       await audit(tx, req.user.tid, req.user.sub, 'reception.create', 'job_order', jo.id, {
         number: jo.number, source: d.source, km: d.kmEntry,
@@ -330,6 +355,7 @@ export async function receptionRoutes(app: FastifyInstance) {
               intentions = ${JSON.stringify(d.intentions)}, service_description = ${d.serviceDescription || null},
               booking_date = ${d.bookingDate || null}, updated_at = now()
             where id = ${d.draftId}`
+          await syncJobServices(tx, req.user.tid, existing.id, req.user.sub, d.services)
           return reply.send({ id: existing.id, number: existing.number, draft: true })
         }
       }
@@ -351,6 +377,7 @@ export async function receptionRoutes(app: FastifyInstance) {
           ${req.user.sub}, now()
         ) returning id, number`
       if (d.bookingDate) await tx`update job_orders set booking_status = 'scheduled' where id = ${jo.id}`
+      await syncJobServices(tx, req.user.tid, jo.id, req.user.sub, d.services)
       await audit(tx, req.user.tid, req.user.sub, 'reception.draft_save', 'job_order', jo.id, { number: jo.number })
       return reply.send({ id: jo.id, number: jo.number, draft: true })
     })
@@ -369,6 +396,10 @@ export async function receptionRoutes(app: FastifyInstance) {
         where j.id = ${joId}`
       if (!jo) return reply.code(404).send({ error: 'Rascunho não encontrado' })
 
+      const servicos = await tx`
+        select service_type_id, type_name, notes from job_services
+        where job_order_id = ${joId} order by created_at`
+
       // Fotos já carregadas neste rascunho. Sem isto, quem retoma não sabe
       // o que já fez e volta a fotografar tudo (ou perde o trabalho todo).
       const photos = await tx`
@@ -378,7 +409,7 @@ export async function receptionRoutes(app: FastifyInstance) {
         const { data } = await supabase.storage.from(BUCKET).createSignedUrl(p.storage_path, 3600)
         return { id: p.id, zone: p.zone, isRequired: p.is_required, url: data?.signedUrl || null }
       }))
-      return reply.send({ data: jo, photos: comUrl })
+      return reply.send({ data: jo, photos: comUrl, servicos })
     })
   })
 
@@ -782,6 +813,11 @@ export async function receptionRoutes(app: FastifyInstance) {
         signatureUrl = data?.signedUrl
       }
 
+      // Serviços desta entrada (um ou vários).
+      const servicos = await tx`
+        select id, service_type_id, type_name, status, notes
+        from job_services where job_order_id = ${joId} order by created_at`
+
       // Outras visitas do mesmo carro. É a semente da ficha viva do veículo:
       // quem abre um carro passa a ver o que já lá foi feito, sem procurar.
       const historico = await tx`
@@ -802,7 +838,7 @@ export async function receptionRoutes(app: FastifyInstance) {
         const { data } = await supabase.storage.from(BUCKET).createSignedUrl(jo.id_document_path, 3600)
         idDocUrl = data?.signedUrl || null
       }
-      return { ...jo, photos: withUrls, signatureViewUrl: signatureUrl, idDocViewUrl: idDocUrl, historico }
+      return { ...jo, photos: withUrls, signatureViewUrl: signatureUrl, idDocViewUrl: idDocUrl, historico, servicos }
     })
   })
 
