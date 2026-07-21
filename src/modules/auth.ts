@@ -28,7 +28,7 @@ export async function authRoutes(app: FastifyInstance) {
     const accessToken = app.jwt.sign(payload, { expiresIn: process.env.JWT_EXPIRES || '8h' })
     const refreshToken = app.jwt.sign(
       { sub: auth.user.id, typ: 'refresh' },
-      { expiresIn: process.env.JWT_REFRESH_EXPIRES || '30d' }
+      { expiresIn: process.env.JWT_REFRESH_EXPIRES || '7d' }
     )
 
     return reply.send({
