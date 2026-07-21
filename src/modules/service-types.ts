@@ -20,6 +20,7 @@ function guard(perm: string) {
 const TypeSchema = z.object({
   name: z.string().min(2, 'Nome demasiado curto'),
   clientPresence: z.enum(['waits', 'leaves']).default('leaves'),
+  allowsQuickEntry: z.boolean().optional(),
   sortOrder: z.number().int().optional(),
 })
 
@@ -31,10 +32,10 @@ export async function serviceTypeRoutes(app: FastifyInstance) {
     const all = req.query?.all === '1' || req.query?.all === 'true'
     return withTenant(req.user.tid, async (tx) => {
       const rows = all
-        ? await tx`select id, name, client_presence, sort_order, active
+        ? await tx`select id, name, client_presence, allows_quick_entry, sort_order, active
                    from service_types where tenant_id = ${req.user.tid}
                    order by active desc, sort_order, name`
-        : await tx`select id, name, client_presence, sort_order, active
+        : await tx`select id, name, client_presence, allows_quick_entry, sort_order, active
                    from service_types where tenant_id = ${req.user.tid} and active = true
                    order by sort_order, name`
       return { data: rows }
@@ -52,10 +53,10 @@ export async function serviceTypeRoutes(app: FastifyInstance) {
         select coalesce(max(sort_order), 0) + 1 as prox
         from service_types where tenant_id = ${req.user.tid}`
       const [t] = await tx`
-        insert into service_types (tenant_id, name, client_presence, sort_order, created_by)
-        values (${req.user.tid}, ${d.name.trim()}, ${d.clientPresence},
+        insert into service_types (tenant_id, name, client_presence, allows_quick_entry, sort_order, created_by)
+        values (${req.user.tid}, ${d.name.trim()}, ${d.clientPresence}, ${d.allowsQuickEntry ?? false},
                 ${d.sortOrder ?? prox}, ${req.user.sub})
-        returning id, name, client_presence, sort_order, active`
+        returning id, name, client_presence, allows_quick_entry, sort_order, active`
       await audit(tx, req.user.tid, req.user.sub, 'service_type.create', 'service_type', t.id, { name: d.name })
       return reply.send(t)
     })
@@ -74,6 +75,7 @@ export async function serviceTypeRoutes(app: FastifyInstance) {
         update service_types set
           name = coalesce(${d.name?.trim() ?? null}, name),
           client_presence = coalesce(${d.clientPresence ?? null}, client_presence),
+          allows_quick_entry = coalesce(${d.allowsQuickEntry ?? null}, allows_quick_entry),
           sort_order = coalesce(${d.sortOrder ?? null}, sort_order),
           active = coalesce(${d.active ?? null}, active)
         where id = ${id}`
