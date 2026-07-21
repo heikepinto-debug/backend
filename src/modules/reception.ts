@@ -620,6 +620,7 @@ export async function receptionRoutes(app: FastifyInstance) {
                exists(select 1 from job_services js where js.job_order_id = jo.id
                       and js.type_name ilike '%PPI%') as has_ppi,
                (select i.id from ppi_inspections i where i.job_order_id = jo.id limit 1) as ppi_id,
+               (select i.status from ppi_inspections i where i.job_order_id = jo.id limit 1) as ppi_status,
                jo.deletion_reason,
                jo.priority_level, jo.priority_reason, jo.priority_rank,
                jo.os_opened_at,

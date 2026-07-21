@@ -99,6 +99,47 @@ export async function ppiRoutes(app: FastifyInstance) {
     })
   })
 
+  // ── Lista de todas as inspeções (o menu de PPIs) ────────────
+  app.get('/ppi', { preHandler: [guard('reception:read')] }, async (req: any) => {
+    const filtro = String(req.query?.status || '')  // '', 'in_progress', 'done'
+    return withTenant(req.user.tid, async (tx) => {
+      const base = tx`
+        select i.id, i.job_order_id, i.level, i.status, i.started_at, i.done_at,
+               jo.number as jo_number, v.plate, v.brand, v.model,
+               c.full_name as customer_name,
+               (select count(*) from ppi_answers a where a.inspection_id = i.id
+                  and (a.value_state is not null or a.value_number is not null
+                       or a.value_text is not null or a.value_path is not null)) as answered
+        from ppi_inspections i
+        join job_orders jo on jo.id = i.job_order_id
+        join vehicles v on v.id = jo.vehicle_id
+        join customers c on c.id = jo.customer_id
+        where i.tenant_id = ${req.user.tid}`
+      const rows = (filtro === 'in_progress' || filtro === 'done')
+        ? await tx`
+            select i.id, i.job_order_id, i.level, i.status, i.started_at, i.done_at,
+                   jo.number as jo_number, v.plate, v.brand, v.model,
+                   c.full_name as customer_name
+            from ppi_inspections i
+            join job_orders jo on jo.id = i.job_order_id
+            join vehicles v on v.id = jo.vehicle_id
+            join customers c on c.id = jo.customer_id
+            where i.tenant_id = ${req.user.tid} and i.status = ${filtro}
+            order by i.started_at desc`
+        : await tx`
+            select i.id, i.job_order_id, i.level, i.status, i.started_at, i.done_at,
+                   jo.number as jo_number, v.plate, v.brand, v.model,
+                   c.full_name as customer_name
+            from ppi_inspections i
+            join job_orders jo on jo.id = i.job_order_id
+            join vehicles v on v.id = jo.vehicle_id
+            join customers c on c.id = jo.customer_id
+            where i.tenant_id = ${req.user.tid}
+            order by (i.status = 'done'), i.started_at desc`
+      return { inspections: rows }
+    })
+  })
+
   // ── Obter uma inspeção com as respostas já guardadas ────────
   app.get('/ppi/:id', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
     const { id } = req.params
