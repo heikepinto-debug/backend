@@ -255,3 +255,121 @@ export async function generateEntryPdf(tenantId: string, joId: string): Promise<
   })
   return prepared.pdfPath
 }
+
+// ============================================================
+// RELATÓRIO PPI — documento de inspeção pré-compra para o cliente
+// Reusa o estilo da lib (marca, cores). Recebe {inspection, sections}.
+// ============================================================
+function buildPpiPdf(data: any): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ size: 'A4', margin: 0, bufferPages: true })
+    const chunks: Buffer[] = []
+    doc.on('data', (c: Buffer) => chunks.push(c))
+    doc.on('end', () => resolve(Buffer.concat(chunks)))
+    doc.on('error', reject)
+
+    const brand = data.brand_primary || '#1B7A3D'
+    const dark = '#1F2937', ink = '#111827', muted = '#6B7280'
+    const soft = tint(brand, 0.90), line = '#E5E7EB'
+    const M = 48, W = 595, CW = W - M * 2
+    const insp = data.inspection
+    const nivel = insp.level === 'basic' ? 'Básico' : insp.level === 'standard' ? 'Standard' : 'Premium'
+
+    const stateLabel: Record<string, string> = { bom: 'Bom', aceitavel: 'Aceitável', mau: 'Mau', na: 'N.A.' }
+    const stateColor: Record<string, string> = { bom: '#16A34A', aceitavel: '#D97706', mau: '#DC2626', na: '#9CA3AF' }
+
+    let y = 44
+    // Cabeçalho
+    let hx = M
+    if (data.logo_buf) { try { doc.image(data.logo_buf, M, y - 4, { fit: [46, 46] }); hx = M + 58 } catch {} }
+    doc.fillColor(brand).fontSize(17).font('Helvetica-Bold').text(clean(data.tenant_name || 'Fuel Injection Technology'), hx, y)
+    doc.fillColor(muted).fontSize(9).font('Helvetica').text('Relatório de Inspeção Pré-Compra (PPI)', hx, y + 22)
+    y += 54
+    doc.moveTo(M, y).lineTo(W - M, y).strokeColor(brand).lineWidth(2).stroke()
+    y += 18
+
+    // Bloco de identificação
+    doc.fillColor(ink).fontSize(15).font('Helvetica-Bold').text(clean(`${insp.plate} · ${insp.brand} ${insp.model || ''}`), M, y)
+    y = doc.y + 4
+    const info = [
+      `Cliente: ${clean(insp.customer_name || '—')}`,
+      `Nível: PPI ${nivel}`,
+      insp.year ? `Ano: ${insp.year}` : null,
+      insp.km_entry != null ? `Km: ${insp.km_entry}` : null,
+      `Data: ${insp.done_at ? new Date(insp.done_at).toLocaleDateString('pt-PT') : new Date(insp.started_at).toLocaleDateString('pt-PT')}`,
+      `Ref: ${clean(insp.jo_number || '')}`,
+    ].filter(Boolean)
+    doc.fillColor(muted).fontSize(9).font('Helvetica').text(info.join('     '), M, y, { width: CW })
+    y = doc.y + 14
+
+    const ensureSpace = (need: number) => { if (y + need > 800) { doc.addPage(); y = 48 } }
+
+    // Secções
+    for (const sec of (data.sections || [])) {
+      ensureSpace(60)
+      // Cabeçalho da secção
+      doc.rect(M, y, CW, 22).fill(soft)
+      doc.fillColor(brand).fontSize(11).font('Helvetica-Bold').text(clean(sec.name), M + 10, y + 5)
+      y += 30
+
+      for (const pt of sec.points) {
+        ensureSpace(40)
+        doc.fillColor(ink).fontSize(10.5).font('Helvetica-Bold').text(clean(pt.name), M + 4, y)
+        y = doc.y + 3
+        for (const r of pt.respostas) {
+          ensureSpace(20)
+          let val = ''
+          if (r.state) val = stateLabel[r.state] || r.state
+          else if (r.number != null) val = `${r.number}${r.unit ? ' ' + r.unit : ''}`
+          else if (r.text) val = clean(r.text)
+          else if (r.url) val = r.type === 'file' ? '(ficheiro anexo)' : '(foto anexa)'
+          // Rótulo do campo
+          doc.fillColor(muted).fontSize(9).font('Helvetica').text(clean(r.label) + ':', M + 12, y, { width: 150, continued: false })
+          // Valor, com cor se for estado
+          const vx = M + 165
+          if (r.state) doc.fillColor(stateColor[r.state] || ink).font('Helvetica-Bold')
+          else doc.fillColor(ink).font('Helvetica')
+          doc.fontSize(9).text(val || '—', vx, y, { width: CW - 165 })
+          y = Math.max(y, doc.y) + 3
+        }
+        y += 4
+      }
+      y += 6
+    }
+
+    // Nota de rodapé / limitação
+    ensureSpace(70)
+    y += 8
+    doc.moveTo(M, y).lineTo(W - M, y).strokeColor(line).lineWidth(1).stroke()
+    y += 10
+    doc.fillColor(muted).fontSize(7.5).font('Helvetica-Oblique').text(
+      'Este relatório reflete a condição do veículo no momento exato da inspeção, com base nas condições observáveis e no equipamento disponível. Não garante a deteção de defeitos ocultos ou que exijam desmontagem extensa. Não constitui garantia de desempenho futuro nem recomendação de compra.',
+      M, y, { width: CW, align: 'justify' })
+    y = doc.y + 8
+    doc.fillColor(muted).fontSize(8).font('Helvetica').text(
+      clean(`${data.tenant_name || 'Fuel Injection Technology'} · ${insp.customer_phone ? '' : ''}Documento gerado em ${new Date().toLocaleDateString('pt-PT')}`),
+      M, y, { width: CW, align: 'center' })
+
+    doc.end()
+  })
+}
+
+export async function generatePpiReport(tenantId: string, inspectionId: string, reportData: any): Promise<string> {
+  // reportData = { inspection, sections } vindo do endpoint
+  const prepared: any = { ...reportData }
+  // Branding do tenant
+  await withTenant(tenantId, async (tx) => {
+    const [t] = await tx`select name, logo_url, brand_primary from tenants where id = ${tenantId}`
+    prepared.tenant_name = t?.name
+    prepared.brand_primary = t?.brand_primary
+    prepared.logo_url = t?.logo_url
+  })
+  if (prepared.logo_url) {
+    try { const res = await fetch(prepared.logo_url); if (res.ok) prepared.logo_buf = Buffer.from(await res.arrayBuffer()) } catch {}
+  }
+  const buf = await buildPpiPdf(prepared)
+  const path = `${tenantId}/ppi/${inspectionId}/relatorio-${Date.now()}.pdf`
+  const { error } = await supabase.storage.from(BUCKET).upload(path, buf, { contentType: 'application/pdf', upsert: true })
+  if (error) throw error
+  return path
+}
