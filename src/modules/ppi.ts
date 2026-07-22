@@ -282,6 +282,7 @@ export async function ppiRoutes(app: FastifyInstance) {
       const [insp] = await tx`
         select i.id, i.job_order_id, i.level, i.status, i.started_at, i.done_at,
                i.share_token, i.share_expires_at,
+               i.fuel_type, i.drivetrain, i.gearbox, i.characterised_at,
                jo.number as jo_number, v.plate, v.brand, v.model, c.full_name as customer_name
         from ppi_inspections i
         join job_orders jo on jo.id = i.job_order_id
@@ -308,6 +309,30 @@ export async function ppiRoutes(app: FastifyInstance) {
   // ── AUTOSAVE de uma resposta (campo a campo) ────────────────
   // O coração do "nada se perde": cada valor sobe assim que se mete.
   // Upsert por (inspection_id, field_id) — a última resposta manda.
+  // ── Caracterização do veículo (primeiro passo do workflow) ──
+  app.put('/ppi/:id/characterise', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+    const { id } = req.params
+    const body = z.object({
+      fuelType: z.enum(['gasolina', 'diesel', 'hibrido', 'eletrico']).nullable().optional(),
+      drivetrain: z.enum(['2wd', '4x4']).nullable().optional(),
+      gearbox: z.enum(['manual', 'automatica']).nullable().optional(),
+    }).safeParse(req.body || {})
+    if (!body.success) return reply.code(400).send({ error: 'Dados inválidos' })
+    const d = body.data
+    return withTenant(req.user.tid, async (tx) => {
+      const [insp] = await tx`select id from ppi_inspections where id = ${id} and tenant_id = ${req.user.tid}`
+      if (!insp) return reply.code(404).send({ error: 'Inspeção não encontrada' })
+      await tx`
+        update ppi_inspections set
+          fuel_type = ${d.fuelType ?? null},
+          drivetrain = ${d.drivetrain ?? null},
+          gearbox = ${d.gearbox ?? null},
+          characterised_at = now()
+        where id = ${id}`
+      return reply.send({ ok: true })
+    })
+  })
+
   app.put('/ppi/:id/answer', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
     const { id } = req.params
     const body = z.object({
