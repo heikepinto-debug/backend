@@ -8,7 +8,7 @@
 // ============================================================
 import { FastifyInstance } from 'fastify'
 import { z } from 'zod'
-import { withTenant, audit, can, supabase, BUCKET, sql } from '../lib/core.js'
+import { withTenant, audit, can, supabase, BUCKET } from '../lib/core.js'
 import { generatePpiReport } from '../lib/pdf.js'
 
 function guard(perm: string) {
@@ -24,6 +24,60 @@ const LEVEL_RANK: Record<string, number> = { basic: 1, standard: 2, premium: 3 }
 const includesLevel = (chosen: string, min: string) =>
   (LEVEL_RANK[chosen] || 1) >= (LEVEL_RANK[min] || 1)
 
+// Monta os dados do relatório (modelo + respostas) para uma inspeção.
+// Partilhado pelo endpoint /report e pela geração de PDF.
+async function buildPpiReportData(tenantId: string, id: string) {
+  return withTenant(tenantId, async (tx) => {
+    const [insp] = await tx`
+      select i.id, i.job_order_id, i.level, i.status, i.started_at, i.done_at,
+             jo.number as jo_number, jo.km_entry, v.plate, v.brand, v.model, v.year,
+             c.full_name as customer_name, c.phone as customer_phone
+      from ppi_inspections i
+      join job_orders jo on jo.id = i.job_order_id
+      join vehicles v on v.id = jo.vehicle_id
+      join customers c on c.id = jo.customer_id
+      where i.id = ${id} and i.tenant_id = ${tenantId}`
+    if (!insp) return null
+    const sections = await tx`select id, name, min_level, sort_order from ppi_sections where tenant_id = ${tenantId} and active = true order by sort_order, name`
+    const points = await tx`select id, section_id, name, min_level, sort_order from ppi_points where tenant_id = ${tenantId} and active = true order by sort_order, name`
+    const fields = await tx`select id, point_id, label, field_type, unit, sort_order from ppi_fields where tenant_id = ${tenantId} and active = true order by sort_order, label`
+    const answers = await tx`select field_id, point_id, custom_label, value_state, value_number, value_text, value_path from ppi_answers where inspection_id = ${id}`
+    const ansByField: Record<string, any> = {}
+    const openByPoint: Record<string, any[]> = {}
+    for (const a of answers) { if (a.field_id) ansByField[a.field_id] = a; else if (a.point_id) (openByPoint[a.point_id] ||= []).push(a) }
+    const signUrl = async (p: string | null) => {
+      if (!p) return null
+      const { data } = await supabase.storage.from(BUCKET).createSignedUrl(p, 3600)
+      return data?.signedUrl || null
+    }
+    const tree = []
+    for (const s of sections) {
+      const pts = []
+      for (const p of points.filter((x: any) => x.section_id === s.id)) {
+        const respostas = []
+        let tem = false
+        for (const f of fields.filter((x: any) => x.point_id === p.id)) {
+          const a = ansByField[f.id]
+          const ok = a && (a.value_state || a.value_number != null || a.value_text || a.value_path)
+          if (ok) tem = true
+          respostas.push({ label: f.label, type: f.field_type, unit: f.unit,
+            state: a?.value_state ?? null, number: a?.value_number ?? null, text: a?.value_text ?? null,
+            url: a?.value_path ? await signUrl(a.value_path) : null })
+        }
+        for (const o of (openByPoint[p.id] || [])) {
+          tem = true
+          respostas.push({ label: o.custom_label || 'Nota', type: 'open', unit: null,
+            state: o.value_state ?? null, number: o.value_number ?? null, text: o.value_text ?? null,
+            url: o.value_path ? await signUrl(o.value_path) : null })
+        }
+        if (tem) pts.push({ name: p.name, respostas })
+      }
+      if (pts.length) tree.push({ name: s.name, points: pts })
+    }
+    return { inspection: insp, sections: tree }
+  })
+}
+
 export async function ppiRoutes(app: FastifyInstance) {
 
   // ══ ROTA PÚBLICA — relatório partilhado (SEM autenticação) ══
@@ -33,23 +87,31 @@ export async function ppiRoutes(app: FastifyInstance) {
   app.get('/public/ppi/:token', async (req: any, reply) => {
     const { token } = req.params
     if (!token || token.length < 16) return reply.code(404).send({ error: 'Link inválido' })
-    // O token é único e identifica a inspeção e o seu tenant.
-    const [insp] = await sql`
-      select i.id, i.tenant_id, i.level, i.status, i.done_at, i.started_at,
-             i.share_expires_at,
-             v.plate, v.brand, v.model, v.year, jo.km_entry,
-             t.name as tenant_name, t.brand_primary, t.logo_url
-      from ppi_inspections i
-      join job_orders jo on jo.id = i.job_order_id
-      join vehicles v on v.id = jo.vehicle_id
-      join tenants t on t.id = i.tenant_id
-      where i.share_token = ${token}`
-    if (!insp) return reply.code(404).send({ error: 'Relatório não encontrado' })
-    if (!insp.share_expires_at || new Date(insp.share_expires_at) < new Date())
+    // Descobrir a inspeção pelo token. As tabelas têm RLS por tenant,
+    // por isso usamos o cliente service-role (ignora RLS) só para
+    // resolver token → tenant. O token aleatório é a credencial.
+    const { data: inspRow } = await supabase
+      .from('ppi_inspections')
+      .select('id, tenant_id, level, status, done_at, started_at, share_expires_at, job_order_id')
+      .eq('share_token', token)
+      .maybeSingle()
+    if (!inspRow) return reply.code(404).send({ error: 'Relatório não encontrado' })
+    if (!inspRow.share_expires_at || new Date(inspRow.share_expires_at) < new Date())
       return reply.code(410).send({ error: 'Este link expirou', expired: true })
+
+    // Já com o tenant conhecido, o resto corre dentro do tenant (RLS ok).
+    const insp: any = inspRow
 
     // Montar a árvore de resultados (dentro do tenant, para o RLS).
     return withTenant(insp.tenant_id, async (tx) => {
+      const [extra] = await tx`
+        select v.plate, v.brand, v.model, v.year, jo.km_entry,
+               t.name as tenant_name, t.brand_primary, t.logo_url
+        from job_orders jo
+        join vehicles v on v.id = jo.vehicle_id
+        join tenants t on t.id = jo.tenant_id
+        where jo.id = ${insp.job_order_id}`
+      Object.assign(insp, extra || {})
       const sections = await tx`select id, name, sort_order from ppi_sections where tenant_id = ${insp.tenant_id} and active = true order by sort_order, name`
       const points = await tx`select id, section_id, name, sort_order from ppi_points where tenant_id = ${insp.tenant_id} and active = true order by sort_order, name`
       const fields = await tx`select id, point_id, label, field_type, unit, sort_order from ppi_fields where tenant_id = ${insp.tenant_id} and active = true order by sort_order, label`
@@ -306,83 +368,16 @@ export async function ppiRoutes(app: FastifyInstance) {
   // é o que se apresenta ao comprador.
   app.get('/ppi/:id/report', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
     const { id } = req.params
-    return withTenant(req.user.tid, async (tx) => {
-      const [insp] = await tx`
-        select i.id, i.job_order_id, i.level, i.status, i.started_at, i.done_at,
-               jo.number as jo_number, jo.km_entry, v.plate, v.brand, v.model, v.year,
-               c.full_name as customer_name, c.phone as customer_phone
-        from ppi_inspections i
-        join job_orders jo on jo.id = i.job_order_id
-        join vehicles v on v.id = jo.vehicle_id
-        join customers c on c.id = jo.customer_id
-        where i.id = ${id} and i.tenant_id = ${req.user.tid}`
-      if (!insp) return reply.code(404).send({ error: 'Inspeção não encontrada' })
-
-      const sections = await tx`select id, name, min_level, sort_order from ppi_sections where tenant_id = ${req.user.tid} and active = true order by sort_order, name`
-      const points = await tx`select id, section_id, name, min_level, sort_order from ppi_points where tenant_id = ${req.user.tid} and active = true order by sort_order, name`
-      const fields = await tx`select id, point_id, label, field_type, unit, sort_order from ppi_fields where tenant_id = ${req.user.tid} and active = true order by sort_order, label`
-      const answers = await tx`select field_id, point_id, custom_label, value_state, value_number, value_text, value_path from ppi_answers where inspection_id = ${id}`
-
-      // Mapa de respostas por field_id (e abertas por point).
-      const ansByField: Record<string, any> = {}
-      const openByPoint: Record<string, any[]> = {}
-      for (const a of answers) {
-        if (a.field_id) ansByField[a.field_id] = a
-        else if (a.point_id) { (openByPoint[a.point_id] ||= []).push(a) }
-      }
-      // URLs assinadas para anexos.
-      const signUrl = async (p: string | null) => {
-        if (!p) return null
-        const { data } = await supabase.storage.from(BUCKET).createSignedUrl(p, 3600)
-        return data?.signedUrl || null
-      }
-
-      const tree = []
-      for (const s of sections) {
-        const pts = []
-        for (const p of points.filter((x: any) => x.section_id === s.id)) {
-          const fs = fields.filter((f: any) => f.point_id === p.id)
-          const respostas = []
-          let temResposta = false
-          for (const f of fs) {
-            const a = ansByField[f.id]
-            const preenchido = a && (a.value_state || a.value_number != null || a.value_text || a.value_path)
-            if (preenchido) temResposta = true
-            respostas.push({
-              label: f.label, type: f.field_type, unit: f.unit,
-              state: a?.value_state ?? null, number: a?.value_number ?? null,
-              text: a?.value_text ?? null,
-              url: a?.value_path ? await signUrl(a.value_path) : null,
-            })
-          }
-          // Campos abertos deste ponto.
-          for (const o of (openByPoint[p.id] || [])) {
-            temResposta = true
-            respostas.push({
-              label: o.custom_label || 'Nota', type: 'open', unit: null,
-              state: o.value_state ?? null, number: o.value_number ?? null,
-              text: o.value_text ?? null,
-              url: o.value_path ? await signUrl(o.value_path) : null,
-            })
-          }
-          if (temResposta) pts.push({ name: p.name, respostas })
-        }
-        if (pts.length) tree.push({ name: s.name, points: pts })
-      }
-      return reply.send({ inspection: insp, sections: tree })
-    })
+    const data = await buildPpiReportData(req.user.tid, id)
+    if (!data) return reply.code(404).send({ error: 'Inspeção não encontrada' })
+    return reply.send(data)
   })
 
   // ── Gerar o PDF do relatório e devolver o link ──────────────
   app.get('/ppi/:id/pdf', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
     const { id } = req.params
-    // Reaproveita a estrutura do /report chamando a mesma lógica via HTTP interno.
-    const rep = await app.inject({
-      method: 'GET', url: `/api/v1/ppi/${id}/report`,
-      headers: { authorization: req.headers.authorization },
-    })
-    if (rep.statusCode !== 200) return reply.code(rep.statusCode).send(rep.json())
-    const reportData = rep.json()
+    const reportData = await buildPpiReportData(req.user.tid, id)
+    if (!reportData) return reply.code(404).send({ error: 'Inspeção não encontrada' })
     try {
       const path = await generatePpiReport(req.user.tid, id, reportData)
       const { data, error } = await supabase.storage.from(BUCKET).createSignedUrl(path, 3600)
