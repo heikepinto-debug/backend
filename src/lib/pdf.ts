@@ -18,8 +18,8 @@ function asData<T>(value: any, fallback: T): T {
 
 // Limpa texto para o PDF: normaliza quebras de linha (resolve os "Ð")
 // e remove caracteres de controlo que a fonte não desenha.
-function clean(t: string): string {
-  return (t || '')
+function clean(t: any): string {
+  return String(t ?? '')
     .replace(/\r\n/g, '\n')
     .replace(/\r/g, '\n')
     .replace(/[\u0000-\u0009\u000B-\u001F\u007F]/g, '')
@@ -268,6 +268,7 @@ function buildPpiPdf(data: any): Promise<Buffer> {
     doc.on('end', () => resolve(Buffer.concat(chunks)))
     doc.on('error', reject)
 
+   try {
     const brand = data.brand_primary || '#1B7A3D'
     const dark = '#1F2937', ink = '#111827', muted = '#6B7280'
     const soft = tint(brand, 0.90), line = '#E5E7EB'
@@ -351,6 +352,7 @@ function buildPpiPdf(data: any): Promise<Buffer> {
       M, y, { width: CW, align: 'center' })
 
     doc.end()
+   } catch (e) { reject(e) }
   })
 }
 
