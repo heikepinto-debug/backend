@@ -359,7 +359,7 @@ export async function generatePpiReport(tenantId: string, inspectionId: string, 
   const prepared: any = { ...reportData }
   // Branding do tenant
   await withTenant(tenantId, async (tx) => {
-    const [t] = await tx`select name, logo_url, brand_primary from tenants where id = ${tenantId}`
+    const [t] = await tx`select name, logo_url, brand_primary_color as brand_primary from tenants where id = ${tenantId}`
     prepared.tenant_name = t?.name
     prepared.brand_primary = t?.brand_primary
     prepared.logo_url = t?.logo_url

@@ -106,7 +106,7 @@ export async function ppiRoutes(app: FastifyInstance) {
     return withTenant(insp.tenant_id, async (tx) => {
       const [extra] = await tx`
         select v.plate, v.brand, v.model, v.year, jo.km_entry,
-               t.name as tenant_name, t.brand_primary, t.logo_url
+               t.name as tenant_name, t.brand_primary_color as brand_primary, t.logo_url
         from job_orders jo
         join vehicles v on v.id = jo.vehicle_id
         join tenants t on t.id = jo.tenant_id
@@ -383,8 +383,9 @@ export async function ppiRoutes(app: FastifyInstance) {
       const { data, error } = await supabase.storage.from(BUCKET).createSignedUrl(path, 3600)
       if (error || !data) return reply.code(500).send({ error: 'Falha ao obter o PDF' })
       return reply.send({ url: data.signedUrl })
-    } catch (e) {
-      return reply.code(500).send({ error: 'Falha ao gerar o relatório' })
+    } catch (e: any) {
+      req.log?.error({ err: e }, 'ppi pdf falhou')
+      return reply.code(500).send({ error: 'Falha ao gerar o relatório', detail: String(e?.message || e) })
     }
   })
 
