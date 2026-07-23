@@ -12,6 +12,7 @@ import { taskRoutes } from './modules/tasks.js'
 import { osRoutes } from './modules/os.js'
 import { serviceTypeRoutes } from './modules/service-types.js'
 import { ppiRoutes } from './modules/ppi.js'
+import { updateRoutes } from './modules/updates.js'
 import { sql } from './lib/core.js'
 
 const app = Fastify({ logger: { level: process.env.NODE_ENV === 'production' ? 'warn' : 'info' } })
@@ -58,6 +59,7 @@ await app.register(taskRoutes, { prefix: '/api/v1' })
 await app.register(osRoutes, { prefix: '/api/v1' })
 await app.register(serviceTypeRoutes, { prefix: '/api/v1' })
 await app.register(ppiRoutes, { prefix: '/api/v1' })
+await app.register(updateRoutes, { prefix: '/api/v1' })
 
 app.get('/health', async () => ({ ok: true, product: 'OficinaHub', version: '1.0.0' }))
 
