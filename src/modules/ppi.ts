@@ -172,20 +172,31 @@ export async function ppiRoutes(app: FastifyInstance) {
   // Devolve secções → pontos → campos. Se vier ?level=, filtra ao nível.
   app.get('/ppi/template', { preHandler: [guard('reception:read')] }, async (req: any) => {
     const level = String(req.query?.level || '')
+    // Caracterização do carro: se vier, esconde o que não se aplica.
+    // Se não vier (ainda não caracterizado), mostra tudo — nunca
+    // esconder por falta de informação.
+    const fuel = String(req.query?.fuel || '')
+    const drive = String(req.query?.drivetrain || '')
     return withTenant(req.user.tid, async (tx) => {
       const sections = await tx`
         select id, name, min_level, sort_order from ppi_sections
         where tenant_id = ${req.user.tid} and active = true order by sort_order, name`
       const points = await tx`
-        select id, section_id, name, min_level, hint, sort_order from ppi_points
+        select id, section_id, name, min_level, hint, applies_fuel, applies_drivetrain, sort_order from ppi_points
         where tenant_id = ${req.user.tid} and active = true order by sort_order, name`
       const fields = await tx`
         select id, point_id, label, field_type, unit, required, hint, sort_order from ppi_fields
         where tenant_id = ${req.user.tid} and active = true order by sort_order, label`
 
-      // Montar árvore, filtrando por nível se pedido.
+      // Aplica-se? Lista vazia/nula = aplica-se a tudo.
+      const aplica = (lista: string[] | null, valor: string) =>
+        !lista || lista.length === 0 || !valor || lista.includes(valor)
+
+      // Montar árvore, filtrando por nível e pela caracterização.
       const okSec = (s: any) => !level || includesLevel(level, s.min_level)
-      const okPt = (p: any) => !level || includesLevel(level, p.min_level)
+      const okPt = (p: any) => (!level || includesLevel(level, p.min_level))
+        && aplica(p.applies_fuel, fuel)
+        && aplica(p.applies_drivetrain, drive)
       const tree = sections.filter(okSec).map((s: any) => ({
         ...s,
         points: points.filter((p: any) => p.section_id === s.id && okPt(p)).map((p: any) => ({
