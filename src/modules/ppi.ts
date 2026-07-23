@@ -42,6 +42,9 @@ async function buildPpiReportData(tenantId: string, id: string) {
     const points = await tx`select id, section_id, name, min_level, sort_order from ppi_points where tenant_id = ${tenantId} and active = true order by sort_order, name`
     const fields = await tx`select id, point_id, label, field_type, unit, sort_order from ppi_fields where tenant_id = ${tenantId} and active = true order by sort_order, label`
     const answers = await tx`select field_id, point_id, custom_label, value_state, value_number, value_text, value_path from ppi_answers where inspection_id = ${id}`
+    const extraAtts = await tx`select field_id, path from ppi_attachments where inspection_id = ${id} order by sort_order`
+    const extrasByField: Record<string, string[]> = {}
+    for (const a of extraAtts) { if (a.field_id) (extrasByField[a.field_id] ||= []).push(a.path) }
     const ansByField: Record<string, any> = {}
     const openByPoint: Record<string, any[]> = {}
     for (const a of answers) { if (a.field_id) ansByField[a.field_id] = a; else if (a.point_id) (openByPoint[a.point_id] ||= []).push(a) }
@@ -62,7 +65,8 @@ async function buildPpiReportData(tenantId: string, id: string) {
           if (ok) tem = true
           respostas.push({ label: f.label, type: f.field_type, unit: f.unit,
             state: a?.value_state ?? null, number: a?.value_number ?? null, text: a?.value_text ?? null,
-            url: a?.value_path ? await signUrl(a.value_path) : null })
+            url: a?.value_path ? await signUrl(a.value_path) : null,
+            extras: await Promise.all((extrasByField[f.id] || []).map((pp: string) => signUrl(pp))) })
         }
         for (const o of (openByPoint[p.id] || [])) {
           tem = true
@@ -116,6 +120,9 @@ export async function ppiRoutes(app: FastifyInstance) {
       const points = await tx`select id, section_id, name, sort_order from ppi_points where tenant_id = ${insp.tenant_id} and active = true order by sort_order, name`
       const fields = await tx`select id, point_id, label, field_type, unit, sort_order from ppi_fields where tenant_id = ${insp.tenant_id} and active = true order by sort_order, label`
       const answers = await tx`select field_id, point_id, custom_label, value_state, value_number, value_text, value_path from ppi_answers where inspection_id = ${insp.id}`
+      const extraAtts = await tx`select field_id, path from ppi_attachments where inspection_id = ${insp.id} order by sort_order`
+      const extrasByField: Record<string, string[]> = {}
+      for (const a of extraAtts) { if (a.field_id) (extrasByField[a.field_id] ||= []).push(a.path) }
       const ansByField: Record<string, any> = {}
       const openByPoint: Record<string, any[]> = {}
       for (const a of answers) { if (a.field_id) ansByField[a.field_id] = a; else if (a.point_id) (openByPoint[a.point_id] ||= []).push(a) }
@@ -136,7 +143,8 @@ export async function ppiRoutes(app: FastifyInstance) {
             if (ok) tem = true
             respostas.push({ label: f.label, type: f.field_type, unit: f.unit,
               state: a?.value_state ?? null, number: a?.value_number ?? null, text: a?.value_text ?? null,
-              url: a?.value_path ? await signUrl(a.value_path) : null })
+              url: a?.value_path ? await signUrl(a.value_path) : null,
+            extras: await Promise.all((extrasByField[f.id] || []).map((pp: string) => signUrl(pp))) })
           }
           for (const o of (openByPoint[p.id] || [])) {
             tem = true
@@ -302,7 +310,13 @@ export async function ppiRoutes(app: FastifyInstance) {
         }
         return { ...a, value_url: url }
       }))
-      return reply.send({ ...insp, answers: withUrls })
+      // Anexos extra (várias fotos por campo).
+      const atts = await tx`select id, field_id, point_id, path, caption, sort_order from ppi_attachments where inspection_id = ${id} order by field_id, sort_order`
+      const attsWithUrls = await Promise.all(atts.map(async (a: any) => {
+        const { data } = await supabase.storage.from(BUCKET).createSignedUrl(a.path, 3600)
+        return { ...a, url: data?.signedUrl || null }
+      }))
+      return reply.send({ ...insp, answers: withUrls, attachments: attsWithUrls })
     })
   })
 
@@ -314,7 +328,7 @@ export async function ppiRoutes(app: FastifyInstance) {
     const { id } = req.params
     const body = z.object({
       fuelType: z.enum(['gasolina', 'diesel', 'hibrido', 'eletrico']).nullable().optional(),
-      drivetrain: z.enum(['2wd', '4x4']).nullable().optional(),
+      drivetrain: z.enum(['2wd', '4x4_desligavel', '4x4_permanente', '4x4']).nullable().optional(),  // '4x4' = legado
       gearbox: z.enum(['manual', 'automatica']).nullable().optional(),
     }).safeParse(req.body || {})
     if (!body.success) return reply.code(400).send({ error: 'Dados inválidos' })
@@ -371,6 +385,39 @@ export async function ppiRoutes(app: FastifyInstance) {
   })
 
   // ── Presign para anexo (foto ou ficheiro PDF) ───────────────
+  // ── Anexos múltiplos: registar uma foto extra num campo ────
+  app.post('/ppi/:id/attachments', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+    const { id } = req.params
+    const body = z.object({
+      fieldId: z.string().uuid(),
+      pointId: z.string().uuid().nullable().optional(),
+      path: z.string().min(3),
+      caption: z.string().max(200).nullable().optional(),
+    }).safeParse(req.body)
+    if (!body.success) return reply.code(400).send({ error: 'Dados inválidos' })
+    const d = body.data
+    return withTenant(req.user.tid, async (tx) => {
+      const [insp] = await tx`select id from ppi_inspections where id = ${id} and tenant_id = ${req.user.tid}`
+      if (!insp) return reply.code(404).send({ error: 'Inspeção não encontrada' })
+      const [{ n }] = await tx`select coalesce(max(sort_order),0)+1 as n from ppi_attachments where inspection_id = ${id} and field_id = ${d.fieldId}`
+      const [row] = await tx`
+        insert into ppi_attachments (tenant_id, inspection_id, field_id, point_id, path, caption, sort_order)
+        values (${req.user.tid}, ${id}, ${d.fieldId}, ${d.pointId ?? null}, ${d.path}, ${d.caption ?? null}, ${n})
+        returning id, path, caption, sort_order`
+      const { data } = await supabase.storage.from(BUCKET).createSignedUrl(row.path, 3600)
+      return reply.send({ ...row, url: data?.signedUrl || null })
+    })
+  })
+
+  // ── Apagar uma foto extra ──────────────────────────────────
+  app.delete('/ppi/:id/attachments/:attId', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+    const { id, attId } = req.params
+    return withTenant(req.user.tid, async (tx) => {
+      await tx`delete from ppi_attachments where id = ${attId} and inspection_id = ${id} and tenant_id = ${req.user.tid}`
+      return reply.send({ ok: true })
+    })
+  })
+
   app.post('/ppi/:id/attach/presign', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
     const { id } = req.params
     const body = z.object({
