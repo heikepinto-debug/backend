@@ -169,10 +169,10 @@ export async function ppiRoutes(app: FastifyInstance) {
         select id, name, min_level, sort_order from ppi_sections
         where tenant_id = ${req.user.tid} and active = true order by sort_order, name`
       const points = await tx`
-        select id, section_id, name, min_level, sort_order from ppi_points
+        select id, section_id, name, min_level, hint, sort_order from ppi_points
         where tenant_id = ${req.user.tid} and active = true order by sort_order, name`
       const fields = await tx`
-        select id, point_id, label, field_type, unit, required, sort_order from ppi_fields
+        select id, point_id, label, field_type, unit, required, hint, sort_order from ppi_fields
         where tenant_id = ${req.user.tid} and active = true order by sort_order, label`
 
       // Montar árvore, filtrando por nível se pedido.
