@@ -501,6 +501,43 @@ export async function ppiRoutes(app: FastifyInstance) {
   app.post('/ppi/:id/done', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
     const { id } = req.params
     return withTenant(req.user.tid, async (tx) => {
+      const [insp] = await tx`select id, level, fuel_type, drivetrain from ppi_inspections where id = ${id} and tenant_id = ${req.user.tid}`
+      if (!insp) return reply.code(404).send({ error: 'Inspeção não encontrada' })
+
+      // Campos obrigatórios que se aplicam a este carro e nível.
+      const obrig = await tx`
+        select f.id, f.label, p.name as point_name, s.name as section_name,
+               p.min_level as p_level, s.min_level as s_level,
+               p.applies_fuel, p.applies_drivetrain
+        from ppi_fields f
+        join ppi_points p on p.id = f.point_id
+        join ppi_sections s on s.id = p.section_id
+        where f.tenant_id = ${req.user.tid} and f.required = true
+          and f.active = true and p.active = true and s.active = true`
+      const aplica = (lista: string[] | null, valor: string | null) =>
+        !lista || lista.length === 0 || !valor || lista.includes(valor)
+      const exigidos = obrig.filter((f: any) =>
+        includesLevel(insp.level, f.s_level) && includesLevel(insp.level, f.p_level)
+        && aplica(f.applies_fuel, insp.fuel_type)
+        && aplica(f.applies_drivetrain, insp.drivetrain))
+
+      if (exigidos.length) {
+        const ids = exigidos.map((f: any) => f.id)
+        const preenchidos = await tx`
+          select field_id from ppi_answers
+          where inspection_id = ${id} and field_id = any(${ids})
+            and (value_path is not null or value_state is not null
+                 or value_number is not null or value_text is not null)`
+        const feitos = new Set(preenchidos.map((a: any) => a.field_id))
+        const faltam = exigidos.filter((f: any) => !feitos.has(f.id))
+        if (faltam.length) {
+          return reply.code(400).send({
+            error: 'Faltam itens obrigatórios',
+            missing: faltam.map((f: any) => ({ section: f.section_name, point: f.point_name, label: f.label })),
+          })
+        }
+      }
+
       await tx`update ppi_inspections set status = 'done', done_at = now() where id = ${id} and tenant_id = ${req.user.tid}`
       await audit(tx, req.user.tid, req.user.sub, 'ppi.done', 'ppi_inspection', id, {})
       return reply.send({ ok: true })
