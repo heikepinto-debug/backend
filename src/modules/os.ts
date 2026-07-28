@@ -165,7 +165,14 @@ export async function osRoutes(app: FastifyInstance) {
           } catch { /* sem fotos — segue */ }
         }
         const [tenant] = await tx`select diag_authorization_on from tenants where id = ${req.user.tid}`
-        return { jo, problems, diagAuthorizationOn: tenant?.diag_authorization_on ?? true }
+        // Serviços do carro, cada um com o seu estado e quem o trata.
+        const services = await tx`
+          select s.id, s.type_name, s.status, s.status_note, s.assigned_to, s.notes,
+                 u.full_name as assigned_name
+          from job_services s
+          left join users u on u.id = s.assigned_to
+          where s.job_order_id = ${joId} order by s.created_at`
+        return { jo, problems, services, diagAuthorizationOn: tenant?.diag_authorization_on ?? true }
       })
     } catch (e: any) {
       app.log.error({ err: e, joId }, 'os load failed')
@@ -174,6 +181,56 @@ export async function osRoutes(app: FastifyInstance) {
   })
 
   // ── Adicionar um problema (achado da equipa) ────────────────
+  // ── Mudar o estado de um serviço (grava transição) ─────────
+  app.post('/os/services/:sid/status', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+    const { sid } = req.params
+    const ESTADOS = ['awaiting_diagnosis','pending','in_progress','awaiting_approval','awaiting_part','on_hold','done','not_done']
+    const b = z.object({
+      status: z.enum(ESTADOS as [string, ...string[]]),
+      reason: z.string().max(500).nullable().optional(),
+      assignedTo: z.string().uuid().nullable().optional(),
+    }).safeParse(req.body)
+    if (!b.success) return reply.code(400).send({ error: 'Dados inválidos' })
+    const d = b.data
+    return withTenant(req.user.tid, async (tx) => {
+      const [svc] = await tx`select id, status from job_services where id = ${sid} and tenant_id = ${req.user.tid}`
+      if (!svc) return reply.code(404).send({ error: 'Serviço não encontrado' })
+
+      // "Não feito" e os recuos devem ter motivo — mas não travamos:
+      // avisamos no frontend. Aqui só registamos com fidelidade.
+      await tx`update job_services set
+        status = ${d.status},
+        status_note = ${d.reason ?? null}
+        where id = ${sid}`
+      if (d.assignedTo !== undefined) {
+        await tx`update job_services set assigned_to = ${d.assignedTo ?? null} where id = ${sid} and tenant_id = ${req.user.tid}`
+      }
+
+      // A transição só cresce — nunca se reescreve. É o filme completo.
+      await tx`insert into job_service_transitions
+        (tenant_id, job_service_id, from_status, to_status, reason, changed_by)
+        values (${req.user.tid}, ${sid}, ${svc.status}, ${d.status}, ${d.reason ?? null}, ${req.user.sub})`
+
+      await audit(tx, req.user.tid, req.user.sub, 'job_service.status', 'job_service', sid,
+        { de: svc.status, para: d.status, motivo: d.reason ?? null })
+      return reply.send({ ok: true, status: d.status })
+    })
+  })
+
+  // ── Histórico de transições de um serviço ──────────────────
+  app.get('/os/services/:sid/history', { preHandler: [guard('reception:read')] }, async (req: any) => {
+    const { sid } = req.params
+    return withTenant(req.user.tid, async (tx) => {
+      const rows = await tx`
+        select t.from_status, t.to_status, t.reason, t.changed_at, u.full_name as by_name
+        from job_service_transitions t
+        left join users u on u.id = t.changed_by
+        where t.job_service_id = ${sid} and t.tenant_id = ${req.user.tid}
+        order by t.changed_at`
+      return { history: rows }
+    })
+  })
+
   app.post('/os/:joId/problems', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
     const { joId } = req.params
     const schema = z.object({ description: z.string().min(2), origin: z.enum(['customer', 'team']).default('team') })
