@@ -150,7 +150,10 @@ export async function osRoutes(app: FastifyInstance) {
           left join users ua on ua.id = jo.diag_authorized_by
           where jo.id = ${joId}`
         if (!jo) return reply.code(404).send({ error: 'não encontrada' })
-        const problems = await tx`select * from problems where job_order_id = ${joId} order by sort_order, created_at`
+        const problems = await tx`select p.*, s.type_name as service_name, s.status as service_status
+          from problems p
+          left join job_services s on s.id = p.resolved_service_id
+          where p.job_order_id = ${joId} order by p.sort_order, p.created_at`
         // fotos por problema (protegido — uma falha de storage não deita a OS abaixo)
         for (const p of problems as any[]) {
           p.photos = []
@@ -168,7 +171,7 @@ export async function osRoutes(app: FastifyInstance) {
         // Serviços do carro, cada um com o seu estado e quem o trata.
         const services = await tx`
           select s.id, s.type_name, s.status, s.status_note, s.assigned_to, s.notes,
-                 u.full_name as assigned_name
+                 s.source, s.from_problem_id, u.full_name as assigned_name
           from job_services s
           left join users u on u.id = s.assigned_to
           where s.job_order_id = ${joId} order by s.created_at`
@@ -228,6 +231,62 @@ export async function osRoutes(app: FastifyInstance) {
         where t.job_service_id = ${sid} and t.tenant_id = ${req.user.tid}
         order by t.changed_at`
       return { history: rows }
+    })
+  })
+
+  // ── Converter um achado em serviço a fazer ─────────────────
+  app.post('/os/problems/:pid/to-service', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+    const { pid } = req.params
+    const b = z.object({
+      typeName: z.string().min(2).max(160).optional(),   // nome do serviço; por defeito usa a descrição do achado
+    }).safeParse(req.body || {})
+    if (!b.success) return reply.code(400).send({ error: 'Dados inválidos' })
+    return withTenant(req.user.tid, async (tx) => {
+      const [p] = await tx`select id, job_order_id, description, resolved_service_id from problems where id = ${pid} and tenant_id = ${req.user.tid}`
+      if (!p) return reply.code(404).send({ error: 'Achado não encontrado' })
+      if (p.resolved_service_id) return reply.code(409).send({ error: 'Este achado já foi convertido em serviço' })
+
+      const nome = (b.data.typeName || p.description).trim().slice(0, 160)
+      // Cria o serviço, marcado como vindo do diagnóstico e ligado ao achado.
+      const [svc] = await tx`
+        insert into job_services (tenant_id, job_order_id, type_name, status, source, from_problem_id, created_by)
+        values (${req.user.tid}, ${p.job_order_id}, ${nome}, 'pending', 'diagnosis', ${pid}, ${req.user.sub})
+        returning id`
+      // Primeira transição do serviço (histórico começa aqui).
+      await tx`insert into job_service_transitions (tenant_id, job_service_id, from_status, to_status, reason, changed_by)
+        values (${req.user.tid}, ${svc.id}, null, 'pending', 'Criado a partir do diagnóstico', ${req.user.sub})`
+      // Marca o achado como convertido e liga-o ao serviço.
+      await tx`update problems set status = 'converted', resolved_service_id = ${svc.id}, updated_at = now() where id = ${pid}`
+      await audit(tx, req.user.tid, req.user.sub, 'os.problem_to_service', 'problem', pid, { serviceId: svc.id, nome })
+      return reply.send({ ok: true, serviceId: svc.id })
+    })
+  })
+
+  // ── Dispensar um achado (não se faz), com motivo ───────────
+  app.post('/os/problems/:pid/dismiss', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+    const { pid } = req.params
+    const b = z.object({ reason: z.string().min(2).max(500) }).safeParse(req.body || {})
+    if (!b.success) return reply.code(400).send({ error: 'É preciso um motivo para dispensar.' })
+    return withTenant(req.user.tid, async (tx) => {
+      const [p] = await tx`select id, resolved_service_id from problems where id = ${pid} and tenant_id = ${req.user.tid}`
+      if (!p) return reply.code(404).send({ error: 'Achado não encontrado' })
+      if (p.resolved_service_id) return reply.code(409).send({ error: 'Este achado já virou serviço — não se pode dispensar' })
+      await tx`update problems set status = 'dismissed', dismiss_reason = ${b.data.reason}, updated_at = now() where id = ${pid}`
+      await audit(tx, req.user.tid, req.user.sub, 'os.problem_dismiss', 'problem', pid, { motivo: b.data.reason })
+      return reply.send({ ok: true })
+    })
+  })
+
+  // ── Reabrir um achado dispensado (volta a decidir) ─────────
+  app.post('/os/problems/:pid/reopen', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+    const { pid } = req.params
+    return withTenant(req.user.tid, async (tx) => {
+      const [p] = await tx`select id, resolved_service_id from problems where id = ${pid} and tenant_id = ${req.user.tid}`
+      if (!p) return reply.code(404).send({ error: 'Achado não encontrado' })
+      if (p.resolved_service_id) return reply.code(409).send({ error: 'Já virou serviço' })
+      await tx`update problems set status = 'diagnosed', dismiss_reason = null, updated_at = now() where id = ${pid}`
+      await audit(tx, req.user.tid, req.user.sub, 'os.problem_reopen', 'problem', pid, {})
+      return reply.send({ ok: true })
     })
   })
 
