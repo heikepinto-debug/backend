@@ -169,11 +169,16 @@ export async function osRoutes(app: FastifyInstance) {
         }
         const [tenant] = await tx`select diag_authorization_on from tenants where id = ${req.user.tid}`
         // Serviços do carro, cada um com o seu estado e quem o trata.
+        const podeCusto = can(req.user.perms, 'finance:read')
         const services = await tx`
           select s.id, s.type_name, s.status, s.status_note, s.assigned_to, s.notes,
-                 s.source, s.from_problem_id, u.full_name as assigned_name
+                 s.source, s.from_problem_id,
+                 s.outsourced, s.supplier_id, s.outsource_status,
+                 ${podeCusto ? tx`s.supplier_cost` : tx`null::numeric`} as supplier_cost,
+                 u.full_name as assigned_name, sup.name as supplier_name
           from job_services s
           left join users u on u.id = s.assigned_to
+          left join suppliers sup on sup.id = s.supplier_id
           where s.job_order_id = ${joId} order by s.created_at`
         return { jo, problems, services, diagAuthorizationOn: tenant?.diag_authorization_on ?? true }
       })
