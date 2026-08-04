@@ -421,10 +421,13 @@ export async function osRoutes(app: FastifyInstance) {
         return reply.code(403).send({ error: 'Não podes autorizar o teu próprio diagnóstico' })
 
       if (b.approve === true) {
-        if (!b.signature) return reply.code(400).send({ error: 'Assinatura obrigatória' })
+        // Ato interno entre pessoas com conta: o login é a assinatura.
+        // Autoria, momento, auditoria e a regra de "não autorizas o teu
+        // próprio diagnóstico" já garantem a prova — assinatura seria
+        // redundante. (A assinatura do CLIENTE, na entrada, mantém-se.)
         await tx`update job_orders set status = 'awaiting_quote',
           diag_authorized_at = now(), diag_authorized_by = ${req.user.sub},
-          diag_auth_signature = ${b.signature}, updated_at = now() where id = ${joId}`
+          updated_at = now() where id = ${joId}`
         await logState(tx, req.user.tid, joId, 'diagnosis_review', 'awaiting_quote', req.user.sub)
         await audit(tx, req.user.tid, req.user.sub, 'os.diagnosis_authorize', 'job_order', joId, { number: jo.number })
         return reply.send({ ok: true, approved: true })
