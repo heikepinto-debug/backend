@@ -148,6 +148,7 @@ export async function osRoutes(app: FastifyInstance) {
           left join users uo on uo.id = jo.os_opened_by
           left join users us on us.id = jo.diag_submitted_by
           left join users ua on ua.id = jo.diag_authorized_by
+          left join users ur on ur.id = jo.responsible_id
           where jo.id = ${joId}`
         if (!jo) return reply.code(404).send({ error: 'não encontrada' })
         const problems = await tx`select p.*, s.type_name as service_name, s.status as service_status
@@ -180,7 +181,19 @@ export async function osRoutes(app: FastifyInstance) {
           left join users u on u.id = s.assigned_to
           left join suppliers sup on sup.id = s.supplier_id
           where s.job_order_id = ${joId} order by s.created_at`
-        return { jo, problems, services, diagAuthorizationOn: tenant?.diag_authorization_on ?? true }
+        // Executantes de cada serviço.
+        const workers = await tx`
+          select w.job_service_id, w.user_id, w.is_helper, u.full_name
+          from job_service_workers w join users u on u.id = w.user_id
+          where w.tenant_id = ${req.user.tid}
+            and w.job_service_id in (select id from job_services where job_order_id = ${joId})`
+        for (const s of services) {
+          (s as any).workers = workers.filter((w: any) => w.job_service_id === s.id)
+            .map((w: any) => ({ userId: w.user_id, name: w.full_name, isHelper: w.is_helper }))
+        }
+        // Equipa disponível para escolher (responsável / ajudas).
+        const team = await tx`select id, full_name from users where tenant_id = ${req.user.tid} and active = true order by full_name`
+        return { jo, problems, services, team, diagAuthorizationOn: tenant?.diag_authorization_on ?? true }
       })
     } catch (e: any) {
       app.log.error({ err: e, joId }, 'os load failed')
@@ -190,6 +203,44 @@ export async function osRoutes(app: FastifyInstance) {
 
   // ── Adicionar um problema (achado da equipa) ────────────────
   // ── Mudar o estado de um serviço (grava transição) ─────────
+  // ── Responsável do carro (um) ──────────────────────────────
+  app.post('/os/:joId/responsible', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+    const { joId } = req.params
+    const b = z.object({ userId: z.string().uuid().nullable() }).safeParse(req.body)
+    if (!b.success) return reply.code(400).send({ error: 'Dados inválidos' })
+    return withTenant(req.user.tid, async (tx) => {
+      const [jo] = await tx`select id from job_orders where id = ${joId} and tenant_id = ${req.user.tid}`
+      if (!jo) return reply.code(404).send({ error: 'OS não encontrada' })
+      await tx`update job_orders set responsible_id = ${b.data.userId} where id = ${joId}`
+      await audit(tx, req.user.tid, req.user.sub, 'os.responsible', 'job_order', joId, { userId: b.data.userId })
+      return reply.send({ ok: true })
+    })
+  })
+
+  // ── Executantes de um serviço (vários) ─────────────────────
+  app.post('/os/services/:sid/workers', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+    const { sid } = req.params
+    const b = z.object({ userId: z.string().uuid(), isHelper: z.boolean().default(false) }).safeParse(req.body)
+    if (!b.success) return reply.code(400).send({ error: 'Dados inválidos' })
+    return withTenant(req.user.tid, async (tx) => {
+      const [svc] = await tx`select id from job_services where id = ${sid} and tenant_id = ${req.user.tid}`
+      if (!svc) return reply.code(404).send({ error: 'Serviço não encontrado' })
+      await tx`insert into job_service_workers (tenant_id, job_service_id, user_id, is_helper)
+        values (${req.user.tid}, ${sid}, ${b.data.userId}, ${b.data.isHelper})
+        on conflict (job_service_id, user_id) do update set is_helper = ${b.data.isHelper}`
+      await audit(tx, req.user.tid, req.user.sub, 'job_service.worker_add', 'job_service', sid, { userId: b.data.userId, isHelper: b.data.isHelper })
+      return reply.send({ ok: true })
+    })
+  })
+
+  app.delete('/os/services/:sid/workers/:uid', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+    const { sid, uid } = req.params
+    return withTenant(req.user.tid, async (tx) => {
+      await tx`delete from job_service_workers where job_service_id = ${sid} and user_id = ${uid} and tenant_id = ${req.user.tid}`
+      return reply.send({ ok: true })
+    })
+  })
+
   app.post('/os/services/:sid/status', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
     const { sid } = req.params
     const ESTADOS = ['awaiting_diagnosis','pending','in_progress','awaiting_approval','awaiting_part','on_hold','done','not_done']
