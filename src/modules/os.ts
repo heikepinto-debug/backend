@@ -204,6 +204,23 @@ export async function osRoutes(app: FastifyInstance) {
   // ── Adicionar um problema (achado da equipa) ────────────────
   // ── Mudar o estado de um serviço (grava transição) ─────────
   // ── Responsável do carro (um) ──────────────────────────────
+  // ── Marcar o carro como pronto (confirmado pelo utilizador) ─
+  // Sugerido pela app quando todos os serviços fecham, mas é sempre
+  // uma decisão humana — a app não muda a fase do carro sozinha.
+  app.post('/os/:joId/mark-ready', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+    const { joId } = req.params
+    return withTenant(req.user.tid, async (tx) => {
+      const [jo] = await tx`select id, number, status from job_orders where id = ${joId} and tenant_id = ${req.user.tid}`
+      if (!jo) return reply.code(404).send({ error: 'OS não encontrada' })
+      if (['ready', 'delivered'].includes(jo.status)) return reply.code(409).send({ error: 'O carro já está pronto ou entregue' })
+      const anterior = jo.status
+      await tx`update job_orders set status = 'ready', updated_at = now() where id = ${joId}`
+      await logState(tx, req.user.tid, joId, anterior, 'ready', req.user.sub)
+      await audit(tx, req.user.tid, req.user.sub, 'os.mark_ready', 'job_order', joId, { number: jo.number, de: anterior })
+      return reply.send({ ok: true })
+    })
+  })
+
   app.post('/os/:joId/responsible', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
     const { joId } = req.params
     const b = z.object({ userId: z.string().uuid().nullable() }).safeParse(req.body)
