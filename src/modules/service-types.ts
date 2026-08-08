@@ -84,6 +84,75 @@ export async function serviceTypeRoutes(app: FastifyInstance) {
     })
   })
 
+  // ── Acompanhamentos de um tipo de serviço ──────────────────
+  // O que costuma vir com este serviço: relacionados, materiais,
+  // consumíveis. O preço só é aceite de quem tem pricing:manage.
+  app.get('/service-types/:id/accompaniments', { preHandler: [guard('reception:read')] }, async (req: any) => {
+    return withTenant(req.user.tid, async (tx) => {
+      const rows = await tx`
+        select id, kind, label, default_qty, unit, default_price, auto_suggest, sort_order, active
+        from service_accompaniments
+        where service_type_id = ${req.params.id} and tenant_id = ${req.user.tid} and active = true
+        order by sort_order, label`
+      return { data: rows }
+    })
+  })
+
+  app.post('/service-types/:id/accompaniments', { preHandler: [guard('config:manage')] }, async (req: any, reply) => {
+    const b = z.object({
+      kind: z.enum(['service', 'material', 'consumable']),
+      label: z.string().min(1).max(160),
+      defaultQty: z.number().nullable().optional(),
+      unit: z.string().max(20).nullable().optional(),
+      defaultPrice: z.number().nullable().optional(),
+      autoSuggest: z.boolean().default(true),
+      sortOrder: z.number().int().default(0),
+    }).safeParse(req.body)
+    if (!b.success) return reply.code(400).send({ error: 'Dados inválidos' })
+    const d = b.data
+    const podePreco = can(req.user.perms, 'pricing:manage')
+    return withTenant(req.user.tid, async (tx) => {
+      const [row] = await tx`
+        insert into service_accompaniments
+          (tenant_id, service_type_id, kind, label, default_qty, unit, default_price, auto_suggest, sort_order)
+        values (${req.user.tid}, ${req.params.id}, ${d.kind}, ${d.label.trim()},
+                ${d.defaultQty ?? null}, ${d.unit ?? null},
+                ${podePreco ? (d.defaultPrice ?? null) : null}, ${d.autoSuggest}, ${d.sortOrder})
+        returning id, kind, label, default_qty, unit, default_price, auto_suggest, sort_order, active`
+      await audit(tx, req.user.tid, req.user.sub, 'service_accompaniment.create', 'service_accompaniment', row.id, { label: row.label })
+      return reply.send(row)
+    })
+  })
+
+  app.patch('/service-types/accompaniments/:aid', { preHandler: [guard('config:manage')] }, async (req: any, reply) => {
+    const b = z.object({
+      label: z.string().min(1).max(160).optional(),
+      defaultQty: z.number().nullable().optional(),
+      unit: z.string().max(20).nullable().optional(),
+      defaultPrice: z.number().nullable().optional(),
+      autoSuggest: z.boolean().optional(),
+      sortOrder: z.number().int().optional(),
+      active: z.boolean().optional(),
+    }).safeParse(req.body)
+    if (!b.success) return reply.code(400).send({ error: 'Dados inválidos' })
+    const d = b.data
+    const podePreco = can(req.user.perms, 'pricing:manage')
+    return withTenant(req.user.tid, async (tx) => {
+      await tx`update service_accompaniments set
+        label = coalesce(${d.label?.trim() ?? null}, label),
+        auto_suggest = coalesce(${d.autoSuggest ?? null}, auto_suggest),
+        sort_order = coalesce(${d.sortOrder ?? null}, sort_order),
+        active = coalesce(${d.active ?? null}, active)
+        where id = ${req.params.aid} and tenant_id = ${req.user.tid}`
+      if (d.defaultQty !== undefined) await tx`update service_accompaniments set default_qty = ${d.defaultQty} where id = ${req.params.aid} and tenant_id = ${req.user.tid}`
+      if (d.unit !== undefined) await tx`update service_accompaniments set unit = ${d.unit} where id = ${req.params.aid} and tenant_id = ${req.user.tid}`
+      // O preço só se toca com pricing:manage.
+      if (podePreco && d.defaultPrice !== undefined) await tx`update service_accompaniments set default_price = ${d.defaultPrice} where id = ${req.params.aid} and tenant_id = ${req.user.tid}`
+      await audit(tx, req.user.tid, req.user.sub, 'service_accompaniment.edit', 'service_accompaniment', req.params.aid, d)
+      return reply.send({ ok: true })
+    })
+  })
+
   // Nota: não há DELETE. Desactivar (active=false) tira o tipo da lista
   // de escolha, mas os serviços que já o usaram mantêm-se — o nome fica
   // copiado em job_services.type_name. Nunca se reescreve o passado.
