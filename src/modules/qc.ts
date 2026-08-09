@@ -81,7 +81,7 @@ export async function qcRoutes(app: FastifyInstance) {
       if (faltam.length) return reply.code(400).send({ error: 'Faltam verificações obrigatórias', missing: faltam.length })
 
       await tx`update qc_checks set status = 'approved', approved_by = ${req.user.sub}, approved_at = now(), reject_reason = null where id = ${check.id}`
-      await audit(tx, req.user.tid, req.user.sub, 'qc.approve', 'qc_check', check.id, { joId })
+      await audit(tx, req.user.tid, req.user.sub, 'qc.approve', 'qc_check', check.id, { joId, responsabilidadeAssumida: true })
       return reply.send({ ok: true, approved: true })
     })
   })
