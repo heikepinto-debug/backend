@@ -60,6 +60,43 @@ export async function supplierRoutes(app: FastifyInstance) {
     })
   })
 
+  // ── Tabela de preços de um fornecedor ──────────────────────
+  app.get('/suppliers/:id/prices', { preHandler: [guard('reception:read')] }, async (req: any) => {
+    return withTenant(req.user.tid, async (tx) => {
+      const rows = await tx`select id, label, price from supplier_prices
+        where supplier_id = ${req.params.id} and tenant_id = ${req.user.tid} and active = true
+        order by label`
+      return { prices: rows }
+    })
+  })
+
+  app.post('/suppliers/:id/prices', { preHandler: [guard('config:manage')] }, async (req: any, reply) => {
+    const b = z.object({ label: z.string().min(1).max(160), price: z.number() }).safeParse(req.body)
+    if (!b.success) return reply.code(400).send({ error: 'Dados inválidos' })
+    return withTenant(req.user.tid, async (tx) => {
+      const [row] = await tx`insert into supplier_prices (tenant_id, supplier_id, label, price)
+        values (${req.user.tid}, ${req.params.id}, ${b.data.label.trim()}, ${b.data.price})
+        returning id, label, price`
+      await audit(tx, req.user.tid, req.user.sub, 'supplier_price.create', 'supplier_price', row.id, { label: row.label, price: row.price })
+      return reply.send(row)
+    })
+  })
+
+  app.patch('/suppliers/prices/:pid', { preHandler: [guard('config:manage')] }, async (req: any, reply) => {
+    const b = z.object({ label: z.string().min(1).max(160).optional(), price: z.number().optional(), active: z.boolean().optional() }).safeParse(req.body)
+    if (!b.success) return reply.code(400).send({ error: 'Dados inválidos' })
+    const d = b.data
+    return withTenant(req.user.tid, async (tx) => {
+      await tx`update supplier_prices set
+        label = coalesce(${d.label?.trim() ?? null}, label),
+        price = coalesce(${d.price ?? null}, price),
+        active = coalesce(${d.active ?? null}, active),
+        updated_at = now()
+        where id = ${req.params.pid} and tenant_id = ${req.user.tid}`
+      return reply.send({ ok: true })
+    })
+  })
+
   // ── Marcar/atualizar terceirização de um serviço ───────────
   // O custo só é ACEITE de quem tem finance:read. Se quem edita
   // não tem essa permissão, o custo enviado é ignorado (não se
