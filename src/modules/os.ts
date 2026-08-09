@@ -242,6 +242,35 @@ export async function osRoutes(app: FastifyInstance) {
     })
   })
 
+  // ── Itens de acompanhamento aceites num serviço ────────────
+  // Materiais e consumíveis que a equipa confirmou ao adicionar o
+  // serviço. Alimenta o orçamento. O preço só de pricing:manage.
+  app.post('/os/services/:sid/items', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+    const { sid } = req.params
+    const b = z.object({
+      items: z.array(z.object({
+        kind: z.enum(['material', 'consumable']),
+        label: z.string().min(1).max(160),
+        qty: z.number().nullable().optional(),
+        unit: z.string().max(20).nullable().optional(),
+        price: z.number().nullable().optional(),
+      })),
+    }).safeParse(req.body)
+    if (!b.success) return reply.code(400).send({ error: 'Dados inválidos' })
+    const podePreco = can(req.user.perms, 'pricing:manage')
+    return withTenant(req.user.tid, async (tx) => {
+      const [svc] = await tx`select id from job_services where id = ${sid} and tenant_id = ${req.user.tid}`
+      if (!svc) return reply.code(404).send({ error: 'Serviço não encontrado' })
+      for (const it of b.data.items) {
+        await tx`insert into job_service_items (tenant_id, job_service_id, kind, label, qty, unit, price)
+          values (${req.user.tid}, ${sid}, ${it.kind}, ${it.label.trim()}, ${it.qty ?? null}, ${it.unit ?? null},
+                  ${podePreco ? (it.price ?? null) : null})`
+      }
+      await audit(tx, req.user.tid, req.user.sub, 'job_service.items_add', 'job_service', sid, { n: b.data.items.length })
+      return reply.send({ ok: true })
+    })
+  })
+
   app.post('/os/:joId/responsible', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
     const { joId } = req.params
     const b = z.object({ userId: z.string().uuid().nullable() }).safeParse(req.body)
