@@ -117,6 +117,36 @@ export async function osRoutes(app: FastifyInstance) {
     })
   })
 
+  // ── Departamentos (centros de receita) ─────────────────────
+  app.get('/departments', { preHandler: [guard('reception:read')] }, async (req: any) => {
+    return withTenant(req.user.tid, async (tx) => {
+      const rows = await tx`select id, name, code, sort_order from departments
+        where tenant_id = ${req.user.tid} and active = true order by sort_order, name`
+      return { data: rows }
+    })
+  })
+
+  // ── Definir preço + departamento de um serviço ─────────────
+  // Só quem tem pricing:manage. Guarda o preço ao cliente (sem IVA).
+  app.post('/os/services/:sid/pricing', { preHandler: [guard('pricing:manage')] }, async (req: any, reply) => {
+    const { sid } = req.params
+    const b = z.object({
+      price: z.number().nullable().optional(),
+      departmentId: z.string().uuid().nullable().optional(),
+    }).safeParse(req.body)
+    if (!b.success) return reply.code(400).send({ error: 'Dados inválidos' })
+    const d = b.data
+    return withTenant(req.user.tid, async (tx) => {
+      const [svc] = await tx`select id from job_services where id = ${sid} and tenant_id = ${req.user.tid}`
+      if (!svc) return reply.code(404).send({ error: 'Serviço não encontrado' })
+      if (d.price !== undefined) await tx`update job_services set price = ${d.price} where id = ${sid} and tenant_id = ${req.user.tid}`
+      if (d.departmentId !== undefined) await tx`update job_services set department_id = ${d.departmentId} where id = ${sid} and tenant_id = ${req.user.tid}`
+      await audit(tx, req.user.tid, req.user.sub, 'job_service.pricing', 'job_service', sid, { price: d.price, departmentId: d.departmentId })
+      return reply.send({ ok: true })
+    })
+  })
+
+  // ── Orçamento do carro: preços + totais por departamento ───
   // ── Iniciar OS a partir de uma recepção ─────────────────────
   app.post('/os/start/:joId', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
     const { joId } = req.params
@@ -192,11 +222,14 @@ export async function osRoutes(app: FastifyInstance) {
         const [tenant] = await tx`select diag_authorization_on from tenants where id = ${req.user.tid}`
         // Serviços do carro, cada um com o seu estado e quem o trata.
         const podeCusto = can(req.user.perms, 'finance:read')
+        const podePreco = can(req.user.perms, 'pricing:manage')
         const services = await tx`
           select s.id, s.type_name, s.status, s.status_note, s.assigned_to, s.notes,
                  s.source, s.from_problem_id,
                  s.outsourced, s.supplier_id, s.outsource_status,
                  ${podeCusto ? tx`s.supplier_cost` : tx`null::numeric`} as supplier_cost,
+                 ${podePreco ? tx`s.price` : tx`null::numeric`} as price,
+                 ${podePreco ? tx`s.department_id` : tx`null::uuid`} as department_id,
                  u.full_name as assigned_name, sup.name as supplier_name
           from job_services s
           left join users u on u.id = s.assigned_to
@@ -241,6 +274,153 @@ export async function osRoutes(app: FastifyInstance) {
       return reply.send({ ok: true })
     })
   })
+
+  // ── Departamentos (centros de receita) ─────────────────────
+  app.get('/departments', { preHandler: [guard('reception:read')] }, async (req: any) => {
+    return withTenant(req.user.tid, async (tx) => {
+      const rows = await tx`select id, name, slug, sort_order from departments
+        where tenant_id = ${req.user.tid} and active = true order by sort_order, name`
+      return { data: rows }
+    })
+  })
+
+  // ── Pôr preço + departamento num serviço (só a dona) ───────
+  app.post('/os/services/:sid/pricing', { preHandler: [guard('pricing:manage')] }, async (req: any, reply) => {
+    const b = z.object({
+      price: z.number().nullable().optional(),
+      departmentId: z.string().uuid().nullable().optional(),
+    }).safeParse(req.body)
+    if (!b.success) return reply.code(400).send({ error: 'Dados inválidos' })
+    const d = b.data
+    return withTenant(req.user.tid, async (tx) => {
+      const [svc] = await tx`select id from job_services where id = ${req.params.sid} and tenant_id = ${req.user.tid}`
+      if (!svc) return reply.code(404).send({ error: 'Serviço não encontrado' })
+      if (d.price !== undefined) await tx`update job_services set price = ${d.price} where id = ${req.params.sid} and tenant_id = ${req.user.tid}`
+      if (d.departmentId !== undefined) await tx`update job_services set department_id = ${d.departmentId} where id = ${req.params.sid} and tenant_id = ${req.user.tid}`
+      await audit(tx, req.user.tid, req.user.sub, 'job_service.pricing', 'job_service', req.params.sid, d)
+      return reply.send({ ok: true })
+    })
+  })
+
+  // ── Totais do orçamento por departamento (só a dona) ───────
+  // A visão de gestão: quanto cada departamento gera neste carro.
+  app.get('/os/:joId/budget', { preHandler: [guard('pricing:manage')] }, async (req: any) => {
+    const { joId } = req.params
+    return withTenant(req.user.tid, async (tx) => {
+      const services = await tx`
+        select js.id, js.type_name, js.price, js.department_id, d.name as dept_name, d.slug as dept_slug
+        from job_services js
+        left join departments d on d.id = js.department_id
+        where js.job_order_id = ${joId} and js.tenant_id = ${req.user.tid}
+        order by js.created_at`
+      const items = await tx`
+        select jsi.job_service_id, jsi.kind, jsi.label, jsi.qty, jsi.unit, jsi.price
+        from job_service_items jsi
+        join job_services js on js.id = jsi.job_service_id
+        where js.job_order_id = ${joId} and jsi.tenant_id = ${req.user.tid}`
+      const costs = await tx`
+        select sc.id, sc.job_service_id, sc.department_id, sc.category, sc.label, sc.amount,
+               sc.supplier_department_id, sc.parent_cost_id,
+               dd.name as dept_name, sd.name as supplier_dept_name
+        from service_costs sc
+        join job_services js on js.id = sc.job_service_id
+        left join departments dd on dd.id = sc.department_id
+        left join departments sd on sd.id = sc.supplier_department_id
+        where js.job_order_id = ${joId} and sc.tenant_id = ${req.user.tid}
+        order by sc.created_at`
+
+      const departments = await tx`select id, name, slug from departments where tenant_id = ${req.user.tid} and active = true order by sort_order`
+
+      // ── Margem por departamento ────────────────────────────
+      // Receita de um dep = preço dos serviços que possui + itens
+      //   desses serviços + fornecimentos internos que prestou.
+      // Custo de um dep = todos os service_costs com department_id = dep.
+      const dept: Record<string, { id: string; name: string; receita: number; custo: number }> = {}
+      const D = (id: string, name: string) => (dept[id] = dept[id] || { id, name, receita: 0, custo: 0 })
+
+      let precoCliente = 0  // o que o cliente paga (receita externa, sem contar fornecimentos internos)
+      for (const s of services) {
+        const v = Number(s.price || 0)
+        precoCliente += v
+        if (s.department_id) D(s.department_id, s.dept_name).receita += v
+      }
+      for (const it of items) {
+        const v = Number(it.price || 0)
+        precoCliente += v
+        const parent = services.find((s: any) => s.id === it.job_service_id)
+        if (parent?.department_id) D(parent.department_id, parent.dept_name).receita += v
+      }
+      // custos e fornecimentos internos
+      for (const c of costs) {
+        const v = Number(c.amount || 0)
+        if (c.department_id) D(c.department_id, c.dept_name).custo += v
+        // fornecimento interno: é receita no departamento fornecedor
+        if (c.supplier_department_id) D(c.supplier_department_id, c.supplier_dept_name).receita += v
+      }
+
+      const porDepartamento = Object.values(dept).map(d => ({
+        ...d, margem: d.receita - d.custo,
+      }))
+
+      return {
+        services, items, costs, departments,
+        precoCliente,                                   // total que o cliente paga (sem IVA)
+        porDepartamento,                                // receita, custo e margem de cada departamento
+        margemTotal: porDepartamento.reduce((a, d) => a + d.margem, 0),
+      }
+    })
+  })
+
+  // ── Custos de um serviço (CRUD) — só a dona nesta fase ─────
+  app.get('/os/services/:sid/costs', { preHandler: [guard('pricing:manage')] }, async (req: any) => {
+    return withTenant(req.user.tid, async (tx) => {
+      const rows = await tx`
+        select sc.id, sc.department_id, sc.category, sc.label, sc.amount,
+               sc.supplier_department_id, sc.parent_cost_id,
+               d.name as dept_name, sd.name as supplier_dept_name
+        from service_costs sc
+        left join departments d on d.id = sc.department_id
+        left join departments sd on sd.id = sc.supplier_department_id
+        where sc.job_service_id = ${req.params.sid} and sc.tenant_id = ${req.user.tid}
+        order by sc.created_at`
+      return { data: rows }
+    })
+  })
+
+  app.post('/os/services/:sid/costs', { preHandler: [guard('pricing:manage')] }, async (req: any, reply) => {
+    const b = z.object({
+      departmentId: z.string().uuid().nullable().optional(),
+      category: z.enum(['labour', 'material', 'file', 'outsource', 'other']).default('other'),
+      label: z.string().min(1).max(160),
+      amount: z.number(),
+      supplierDepartmentId: z.string().uuid().nullable().optional(),
+      parentCostId: z.string().uuid().nullable().optional(),
+    }).safeParse(req.body)
+    if (!b.success) return reply.code(400).send({ error: 'Dados inválidos' })
+    const d = b.data
+    return withTenant(req.user.tid, async (tx) => {
+      const [svc] = await tx`select id, department_id from job_services where id = ${req.params.sid} and tenant_id = ${req.user.tid}`
+      if (!svc) return reply.code(404).send({ error: 'Serviço não encontrado' })
+      // por defeito o custo pertence ao departamento dono do serviço
+      const deptId = d.departmentId !== undefined ? d.departmentId : svc.department_id
+      const [row] = await tx`
+        insert into service_costs (tenant_id, job_service_id, department_id, category, label, amount, supplier_department_id, parent_cost_id, created_by)
+        values (${req.user.tid}, ${req.params.sid}, ${deptId}, ${d.category}, ${d.label.trim()}, ${d.amount},
+                ${d.supplierDepartmentId ?? null}, ${d.parentCostId ?? null}, ${req.user.sub})
+        returning id`
+      await audit(tx, req.user.tid, req.user.sub, 'service_cost.create', 'service_cost', row.id, { label: d.label, amount: d.amount, interno: !!d.supplierDepartmentId })
+      return reply.send({ ok: true, id: row.id })
+    })
+  })
+
+  app.delete('/os/costs/:cid', { preHandler: [guard('pricing:manage')] }, async (req: any, reply) => {
+    return withTenant(req.user.tid, async (tx) => {
+      await tx`delete from service_costs where id = ${req.params.cid} and tenant_id = ${req.user.tid}`
+      await audit(tx, req.user.tid, req.user.sub, 'service_cost.delete', 'service_cost', req.params.cid, {})
+      return reply.send({ ok: true })
+    })
+  })
+
 
   // ── Itens de acompanhamento aceites num serviço ────────────
   // Materiais e consumíveis que a equipa confirmou ao adicionar o
