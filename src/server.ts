@@ -15,6 +15,7 @@ import { ppiRoutes } from './modules/ppi.js'
 import { updateRoutes } from './modules/updates.js'
 import { ppiModelRoutes } from './modules/ppi-model.js'
 import { supplierRoutes } from './modules/suppliers.js'
+import { qcRoutes } from './modules/qc.js'
 import { skillRoutes } from './modules/skills.js'
 import { sql } from './lib/core.js'
 
@@ -65,6 +66,7 @@ await app.register(ppiRoutes, { prefix: '/api/v1' })
 await app.register(updateRoutes, { prefix: '/api/v1' })
 await app.register(ppiModelRoutes, { prefix: '/api/v1' })
 await app.register(supplierRoutes, { prefix: '/api/v1' })
+await app.register(qcRoutes, { prefix: '/api/v1' })
 await app.register(skillRoutes, { prefix: '/api/v1' })
 
 app.get('/health', async () => ({ ok: true, product: 'OficinaHub', version: '1.0.0' }))

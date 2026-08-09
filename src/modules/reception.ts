@@ -427,6 +427,14 @@ export async function receptionRoutes(app: FastifyInstance) {
     return withTenant(req.user.tid, async (tx) => {
       const [jo] = await tx`select number, status from job_orders where id = ${joId}`
       if (!jo) return reply.code(404).send({ error: 'Entrada não encontrada' })
+      // BARREIRA: não se entrega sem QC de saída aprovado.
+      // Fecha o buraco que deixou um carro sair sem controlo de qualidade.
+      if (status === 'delivered') {
+        const [qc] = await tx`select status from qc_checks where job_order_id = ${joId} and tenant_id = ${req.user.tid}`
+        if (!qc || qc.status !== 'approved') {
+          return reply.code(409).send({ error: 'Não pode entregar sem o controlo de qualidade aprovado. Faça o QC de saída primeiro.', needsQc: true })
+        }
+      }
       await tx`update job_orders set status = ${status}::jo_status, updated_at = now() where id = ${joId}`
       await audit(tx, req.user.tid, req.user.sub, 'reception.status_change', 'job_order', joId, { from: jo.status, to: status })
       return reply.send({ ok: true, status })
