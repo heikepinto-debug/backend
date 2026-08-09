@@ -96,6 +96,27 @@ export async function osRoutes(app: FastifyInstance) {
     })
   })
 
+  // ── Carros à espera de QC de saída ─────────────────────────
+  // Prontos, mas sem QC aprovado. É o que CHAMA o Yury para o QC —
+  // em vez de ele ter de se lembrar de o abrir carro a carro.
+  app.get('/os/awaiting-qc', { preHandler: [guard('reception:read')] }, async (req: any) => {
+    return withTenant(req.user.tid, async (tx) => {
+      const rows = await tx`
+        select jo.id, jo.number, jo.updated_at,
+               v.plate, v.brand, v.model, c.full_name as customer_name,
+               qc.status as qc_status
+        from job_orders jo
+        join vehicles v on v.id = jo.vehicle_id
+        join customers c on c.id = jo.customer_id
+        left join qc_checks qc on qc.job_order_id = jo.id
+        where jo.tenant_id = ${req.user.tid}
+          and jo.status = 'ready'
+          and (qc.status is null or qc.status <> 'approved')
+        order by jo.updated_at asc`
+      return { data: rows }
+    })
+  })
+
   // ── Iniciar OS a partir de uma recepção ─────────────────────
   app.post('/os/start/:joId', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
     const { joId } = req.params

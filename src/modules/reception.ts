@@ -418,6 +418,51 @@ export async function receptionRoutes(app: FastifyInstance) {
     })
   })
 
+  // ── ENTREGA — com QC obrigatório e assinatura opcional ─────
+  // Fecha o ciclo: não entrega sem QC aprovado; a assinatura do
+  // cliente é opcional (nem sempre é o dono que levanta o carro).
+  app.post('/receptions/:joId/deliver', { preHandler: [guard('reception:create')] }, async (req: any, reply) => {
+    const { joId } = req.params
+    const body = z.object({
+      signatureBase64: z.string().min(100).nullable().optional(),  // opcional
+      receiverName: z.string().max(160).nullable().optional(),     // quem levantou, se não o dono
+    }).safeParse(req.body || {})
+    if (!body.success) return reply.code(400).send({ error: 'Dados inválidos' })
+
+    // Barreira: QC aprovado é obrigatório.
+    const bloqueio = await withTenant(req.user.tid, async (tx) => {
+      const [jo] = await tx`select status from job_orders where id = ${joId} and tenant_id = ${req.user.tid}`
+      if (!jo) return { code: 404, error: 'Entrada não encontrada' }
+      const [qc] = await tx`select status from qc_checks where job_order_id = ${joId} and tenant_id = ${req.user.tid}`
+      if (!qc || qc.status !== 'approved') return { code: 409, error: 'Não pode entregar sem o controlo de qualidade aprovado.', needsQc: true }
+      return null
+    })
+    if (bloqueio) return reply.code(bloqueio.code).send(bloqueio)
+
+    // Assinatura, se veio.
+    let sigPath: string | null = null
+    if (body.data.signatureBase64) {
+      sigPath = `${req.user.tid}/${joId}/delivery-signature-${Date.now()}.png`
+      const buffer = Buffer.from(body.data.signatureBase64, 'base64')
+      const { error } = await supabase.storage.from(BUCKET).upload(sigPath, buffer, { contentType: 'image/png' })
+      if (error) return reply.code(500).send({ error: 'Falha ao guardar assinatura' })
+    }
+
+    return withTenant(req.user.tid, async (tx) => {
+      await tx`update job_orders set
+        status = 'delivered',
+        delivered_at = now(),
+        delivered_by = ${req.user.sub},
+        delivery_signature_url = ${sigPath},
+        delivery_receiver_name = ${body.data.receiverName ?? null},
+        updated_at = now()
+        where id = ${joId}`
+      await audit(tx, req.user.tid, req.user.sub, 'reception.deliver', 'job_order', joId,
+        { comAssinatura: !!sigPath, receiver: body.data.receiverName ?? null })
+      return reply.send({ ok: true })
+    })
+  })
+
   // ── MUDAR ESTADO MANUALMENTE — só o dono (temporário) ───────
   app.post('/receptions/:joId/status', { preHandler: [guard('jobdelete:any')] }, async (req: any, reply) => {
     const { joId } = req.params
