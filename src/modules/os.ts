@@ -372,22 +372,28 @@ export async function osRoutes(app: FastifyInstance) {
   })
 
   // ── Custos de um serviço (CRUD) — só a dona nesta fase ─────
-  app.get('/os/services/:sid/costs', { preHandler: [guard('pricing:manage')] }, async (req: any) => {
+  app.get('/os/services/:sid/costs', { preHandler: [guard('cost:register')] }, async (req: any) => {
+    const podeGestao = can(req.user.perms, 'pricing:manage')
     return withTenant(req.user.tid, async (tx) => {
       const rows = await tx`
         select sc.id, sc.department_id, sc.category, sc.label, sc.amount,
-               sc.supplier_department_id, sc.parent_cost_id,
-               d.name as dept_name, sd.name as supplier_dept_name
+               sc.validated, sc.created_by,
+               ${podeGestao ? tx`sc.supplier_department_id` : tx`null::uuid`} as supplier_department_id,
+               ${podeGestao ? tx`sc.parent_cost_id` : tx`null::uuid`} as parent_cost_id,
+               d.name as dept_name,
+               ${podeGestao ? tx`sd.name` : tx`null::text`} as supplier_dept_name,
+               vu.full_name as validated_by_name
         from service_costs sc
         left join departments d on d.id = sc.department_id
         left join departments sd on sd.id = sc.supplier_department_id
+        left join users vu on vu.id = sc.validated_by
         where sc.job_service_id = ${req.params.sid} and sc.tenant_id = ${req.user.tid}
         order by sc.created_at`
-      return { data: rows }
+      return { data: rows, podeGestao }
     })
   })
 
-  app.post('/os/services/:sid/costs', { preHandler: [guard('pricing:manage')] }, async (req: any, reply) => {
+  app.post('/os/services/:sid/costs', { preHandler: [guard('cost:register')] }, async (req: any, reply) => {
     const b = z.object({
       departmentId: z.string().uuid().nullable().optional(),
       category: z.enum(['labour', 'material', 'file', 'outsource', 'other']).default('other'),
@@ -398,23 +404,53 @@ export async function osRoutes(app: FastifyInstance) {
     }).safeParse(req.body)
     if (!b.success) return reply.code(400).send({ error: 'Dados inválidos' })
     const d = b.data
+    const podeGestao = can(req.user.perms, 'pricing:manage')
+    // Fornecimento interno (cascata) é gestão — só pricing:manage.
+    // Quem só tem cost:register não pode marcar fornecimento interno.
+    const supplierDept = podeGestao ? (d.supplierDepartmentId ?? null) : null
+    const parentCost = podeGestao ? (d.parentCostId ?? null) : null
     return withTenant(req.user.tid, async (tx) => {
       const [svc] = await tx`select id, department_id from job_services where id = ${req.params.sid} and tenant_id = ${req.user.tid}`
       if (!svc) return reply.code(404).send({ error: 'Serviço não encontrado' })
       // por defeito o custo pertence ao departamento dono do serviço
-      const deptId = d.departmentId !== undefined ? d.departmentId : svc.department_id
+      const deptId = (podeGestao && d.departmentId !== undefined) ? d.departmentId : svc.department_id
+      // Custo lançado pela dona nasce já validado; pelo Yury nasce por validar.
+      const nasceValidado = podeGestao
       const [row] = await tx`
-        insert into service_costs (tenant_id, job_service_id, department_id, category, label, amount, supplier_department_id, parent_cost_id, created_by)
+        insert into service_costs (tenant_id, job_service_id, department_id, category, label, amount, supplier_department_id, parent_cost_id, validated, validated_by, validated_at, created_by)
         values (${req.user.tid}, ${req.params.sid}, ${deptId}, ${d.category}, ${d.label.trim()}, ${d.amount},
-                ${d.supplierDepartmentId ?? null}, ${d.parentCostId ?? null}, ${req.user.sub})
+                ${supplierDept}, ${parentCost},
+                ${nasceValidado}, ${nasceValidado ? req.user.sub : null}, ${nasceValidado ? tx`now()` : null},
+                ${req.user.sub})
         returning id`
-      await audit(tx, req.user.tid, req.user.sub, 'service_cost.create', 'service_cost', row.id, { label: d.label, amount: d.amount, interno: !!d.supplierDepartmentId })
+      await audit(tx, req.user.tid, req.user.sub, 'service_cost.create', 'service_cost', row.id, { label: d.label, amount: d.amount, interno: !!supplierDept })
       return reply.send({ ok: true, id: row.id })
     })
   })
 
-  app.delete('/os/costs/:cid', { preHandler: [guard('pricing:manage')] }, async (req: any, reply) => {
+  // Validar um custo — só a dona (pricing:manage). O selo final.
+  app.post('/os/costs/:cid/validate', { preHandler: [guard('pricing:manage')] }, async (req: any, reply) => {
+    const b = z.object({ validated: z.boolean().default(true) }).safeParse(req.body || {})
+    const val = b.success ? b.data.validated : true
     return withTenant(req.user.tid, async (tx) => {
+      await tx`update service_costs set
+        validated = ${val},
+        validated_by = ${val ? req.user.sub : null},
+        validated_at = ${val ? tx`now()` : null}
+        where id = ${req.params.cid} and tenant_id = ${req.user.tid}`
+      await audit(tx, req.user.tid, req.user.sub, 'service_cost.validate', 'service_cost', req.params.cid, { validated: val })
+      return reply.send({ ok: true })
+    })
+  })
+
+  app.delete('/os/costs/:cid', { preHandler: [guard('cost:register')] }, async (req: any, reply) => {
+    return withTenant(req.user.tid, async (tx) => {
+      // Quem só regista pode apagar o que ainda não foi validado;
+      // a dona pode apagar qualquer um.
+      const podeGestao = can(req.user.perms, 'pricing:manage')
+      const [c] = await tx`select validated, created_by from service_costs where id = ${req.params.cid} and tenant_id = ${req.user.tid}`
+      if (!c) return reply.code(404).send({ error: 'Custo não encontrado' })
+      if (!podeGestao && c.validated) return reply.code(403).send({ error: 'Este custo já foi validado pela gestão e não pode ser removido.' })
       await tx`delete from service_costs where id = ${req.params.cid} and tenant_id = ${req.user.tid}`
       await audit(tx, req.user.tid, req.user.sub, 'service_cost.delete', 'service_cost', req.params.cid, {})
       return reply.send({ ok: true })
