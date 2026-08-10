@@ -48,7 +48,7 @@ export function can(perms: string[], needed: string): boolean {
 // ── Login: valida credenciais e devolve payload + branding ──
 export async function authenticate(email: string, password: string) {
   const [user] = await sql`
-    select u.id, u.tenant_id, u.full_name, u.password_hash, u.active,
+    select u.id, u.tenant_id, u.full_name, u.password_hash, u.active, u.platform_admin,
            t.name as tenant_name, t.slug, t.logo_url,
            t.brand_primary_color, t.brand_secondary_color, t.settings,
            t.active as tenant_active
@@ -74,7 +74,7 @@ export async function authenticate(email: string, password: string) {
   await sql`update users set last_login_at = now() where id = ${user.id}`
 
   return {
-    user: { id: user.id, name: user.full_name, email },
+    user: { id: user.id, name: user.full_name, email, platformAdmin: !!user.platform_admin },
     tenant: {
       id: user.tenant_id, slug: user.slug, name: user.tenant_name,
       logoUrl: user.logo_url,
