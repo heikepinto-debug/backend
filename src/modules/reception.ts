@@ -483,9 +483,34 @@ export async function receptionRoutes(app: FastifyInstance) {
           return reply.code(409).send({ error: 'Não pode entregar sem o controlo de qualidade aprovado. Faça o QC de saída primeiro.', needsQc: true })
         }
       }
+      // Ao FORÇAR a finalização, arrumar o que ficaria pendurado, para o
+      // carro não ficar incoerente (ex.: diagnóstico por autorizar preso,
+      // serviços a meio). Fica tudo com rasto de que foi fechado à força.
+      let arrumados = { servicos: 0, achados: 0, diagnostico: false }
+      if (status === 'delivered' && force) {
+        // serviços que não estão num estado terminal → fechados à força
+        const svc = await tx`
+          update job_services set status = 'done', updated_at = now()
+          where job_order_id = ${joId} and tenant_id = ${req.user.tid}
+            and status not in ('done','not_done')
+          returning id`
+        arrumados.servicos = svc.length
+        // achados de diagnóstico ainda por decidir → dispensados
+        const ach = await tx`
+          update problems set status = 'dismissed', updated_at = now()
+          where job_order_id = ${joId} and tenant_id = ${req.user.tid}
+            and status not in ('converted','dismissed')
+          returning id`
+        arrumados.achados = ach.length
+        // se o carro estava num limbo de diagnóstico, limpar os marcadores
+        if (['diagnosis_review','in_diagnosis','awaiting_diagnosis'].includes(jo.status)) {
+          await tx`update job_orders set diag_submitted_at = null, diag_submitted_by = null where id = ${joId} and tenant_id = ${req.user.tid}`
+          arrumados.diagnostico = true
+        }
+      }
       await tx`update job_orders set status = ${status}::jo_status, updated_at = now() where id = ${joId}`
-      await audit(tx, req.user.tid, req.user.sub, 'reception.status_change', 'job_order', joId, { from: jo.status, to: status, forced: force && status === 'delivered' })
-      return reply.send({ ok: true, status })
+      await audit(tx, req.user.tid, req.user.sub, 'reception.status_change', 'job_order', joId, { from: jo.status, to: status, forced: force && status === 'delivered', arrumados: (force && status === 'delivered') ? arrumados : undefined })
+      return reply.send({ ok: true, status, arrumados: (force && status === 'delivered') ? arrumados : undefined })
     })
   })
 
