@@ -117,36 +117,6 @@ export async function osRoutes(app: FastifyInstance) {
     })
   })
 
-  // ── Departamentos (centros de receita) ─────────────────────
-  app.get('/departments', { preHandler: [guard('reception:read')] }, async (req: any) => {
-    return withTenant(req.user.tid, async (tx) => {
-      const rows = await tx`select id, name, code, sort_order from departments
-        where tenant_id = ${req.user.tid} and active = true order by sort_order, name`
-      return { data: rows }
-    })
-  })
-
-  // ── Definir preço + departamento de um serviço ─────────────
-  // Só quem tem pricing:manage. Guarda o preço ao cliente (sem IVA).
-  app.post('/os/services/:sid/pricing', { preHandler: [guard('pricing:manage')] }, async (req: any, reply) => {
-    const { sid } = req.params
-    const b = z.object({
-      price: z.number().nullable().optional(),
-      departmentId: z.string().uuid().nullable().optional(),
-    }).safeParse(req.body)
-    if (!b.success) return reply.code(400).send({ error: 'Dados inválidos' })
-    const d = b.data
-    return withTenant(req.user.tid, async (tx) => {
-      const [svc] = await tx`select id from job_services where id = ${sid} and tenant_id = ${req.user.tid}`
-      if (!svc) return reply.code(404).send({ error: 'Serviço não encontrado' })
-      if (d.price !== undefined) await tx`update job_services set price = ${d.price} where id = ${sid} and tenant_id = ${req.user.tid}`
-      if (d.departmentId !== undefined) await tx`update job_services set department_id = ${d.departmentId} where id = ${sid} and tenant_id = ${req.user.tid}`
-      await audit(tx, req.user.tid, req.user.sub, 'job_service.pricing', 'job_service', sid, { price: d.price, departmentId: d.departmentId })
-      return reply.send({ ok: true })
-    })
-  })
-
-  // ── Orçamento do carro: preços + totais por departamento ───
   // ── Iniciar OS a partir de uma recepção ─────────────────────
   app.post('/os/start/:joId', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
     const { joId } = req.params
