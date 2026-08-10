@@ -467,6 +467,7 @@ export async function receptionRoutes(app: FastifyInstance) {
   app.post('/receptions/:joId/status', { preHandler: [guard('jobdelete:any')] }, async (req: any, reply) => {
     const { joId } = req.params
     const status = String((req.body as any).status || '')
+    const force = (req.body as any).force === true   // atalho de testes do dono
     const allowed = ['awaiting_diagnosis','awaiting_quote','quote_sent','approved','in_progress','quality_check','ready','delivered']
     if (!allowed.includes(status)) return reply.code(400).send({ error: 'Estado inválido' })
     return withTenant(req.user.tid, async (tx) => {
@@ -474,14 +475,16 @@ export async function receptionRoutes(app: FastifyInstance) {
       if (!jo) return reply.code(404).send({ error: 'Entrada não encontrada' })
       // BARREIRA: não se entrega sem QC de saída aprovado.
       // Fecha o buraco que deixou um carro sair sem controlo de qualidade.
-      if (status === 'delivered') {
+      // O dono pode FORÇAR (force:true) — atalho de testes enquanto o
+      // circuito completo não está montado. Fica registado na auditoria.
+      if (status === 'delivered' && !force) {
         const [qc] = await tx`select status from qc_checks where job_order_id = ${joId} and tenant_id = ${req.user.tid}`
         if (!qc || qc.status !== 'approved') {
           return reply.code(409).send({ error: 'Não pode entregar sem o controlo de qualidade aprovado. Faça o QC de saída primeiro.', needsQc: true })
         }
       }
       await tx`update job_orders set status = ${status}::jo_status, updated_at = now() where id = ${joId}`
-      await audit(tx, req.user.tid, req.user.sub, 'reception.status_change', 'job_order', joId, { from: jo.status, to: status })
+      await audit(tx, req.user.tid, req.user.sub, 'reception.status_change', 'job_order', joId, { from: jo.status, to: status, forced: force && status === 'delivered' })
       return reply.send({ ok: true, status })
     })
   })
