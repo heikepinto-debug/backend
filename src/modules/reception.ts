@@ -241,7 +241,6 @@ export async function receptionRoutes(app: FastifyInstance) {
             update job_orders set
               business_unit_id = ${d.businessUnitId}, customer_id = ${customerId}, vehicle_id = ${vehicleId},
               status = 'awaiting_diagnosis', source = ${d.source},
-              booking_status = case when booking_status = 'lead' then null else booking_status end,
               km_entry = ${d.kmEntry}, fuel_level = ${d.fuelLevel},
               declared_valuables = ${d.declaredValuables},
               checklist = ${JSON.stringify(d.checklist)}, damage_zones = ${JSON.stringify(d.damageZones)},
@@ -1098,24 +1097,21 @@ export async function receptionRoutes(app: FastifyInstance) {
     return reply.send({ results })
   })
 
-  // ── MARCAÇÃO RÁPIDA (lead) ──────────────────────────────────
+  // ── MARCAÇÃO RÁPIDA (tabela própria) ────────────────────────
   // A dona lança o mínimo (do WhatsApp); o Yury completa depois.
+  // Nada obrigatório — guarda o que houver.
   app.post('/bookings/quick', { preHandler: [guard('reception:create')] }, async (req: any, reply) => {
     const b = z.object({
       customerName: z.string().max(160).nullable().optional(),
       customerPhone: z.string().max(40).nullable().optional(),
       make: z.string().max(80).nullable().optional(),
       model: z.string().max(80).nullable().optional(),
-      note: z.string().min(1).max(600),                 // a queixa — obrigatória
+      note: z.string().max(600).nullable().optional(),
       bookingDate: z.string().nullable().optional(),
       assignTo: z.string().uuid().nullable().optional(),
     }).safeParse(req.body)
-    if (!b.success) return reply.code(400).send({ error: 'Falta a queixa do cliente (o que precisa).' })
+    if (!b.success) return reply.code(400).send({ error: 'Dados inválidos' })
     const d = b.data
-    // Pelo menos um identificador: nome OU contacto.
-    if (!d.customerName?.trim() && !d.customerPhone?.trim()) {
-      return reply.code(400).send({ error: 'Preciso do contacto ou do nome — pelo menos um, para saber de quem é.' })
-    }
     return withTenant(req.user.tid, async (tx) => {
       let assignTo = d.assignTo ?? null
       if (!assignTo) {
@@ -1127,47 +1123,52 @@ export async function receptionRoutes(app: FastifyInstance) {
           order by u.created_at limit 1`
         assignTo = sup?.id ?? null
       }
-      const [jo] = await tx`
-        insert into job_orders (tenant_id, status, booking_status, customer_name, customer_phone,
-                                booking_make, booking_model,
-                                booking_note, booking_date, assigned_to, booking_created_by, received_by)
-        values (${req.user.tid}, 'draft', 'lead', ${d.customerName?.trim() || null}, ${d.customerPhone?.trim() || null},
-                ${d.make?.trim() || null}, ${d.model?.trim() || null},
-                ${d.note.trim()}, ${d.bookingDate || null}, ${assignTo}, ${req.user.sub}, ${req.user.sub})
-        returning id, number`
-      await audit(tx, req.user.tid, req.user.sub, 'booking.quick_create', 'job_order', jo.id, { customer: d.customerName || d.customerPhone, assignTo })
-      return reply.send({ ok: true, id: jo.id, number: jo.number, assignedTo: assignTo })
+      const [qb] = await tx`
+        insert into quick_bookings (tenant_id, customer_name, customer_phone, make, model, note, booking_date, assigned_to, created_by)
+        values (${req.user.tid}, ${d.customerName?.trim() || null}, ${d.customerPhone?.trim() || null},
+                ${d.make?.trim() || null}, ${d.model?.trim() || null}, ${d.note?.trim() || null},
+                ${d.bookingDate || null}, ${assignTo}, ${req.user.sub})
+        returning id`
+      await audit(tx, req.user.tid, req.user.sub, 'booking.quick_create', 'quick_booking', qb.id, { customer: d.customerName || d.customerPhone })
+      return reply.send({ ok: true, id: qb.id, assignedTo: assignTo })
     })
   })
 
-  // Lista de marcações "a tratar" (leads). O Yury vê as dele; o dono vê todas.
+  // Lista de marcações "a tratar". O Yury vê as dele; o dono vê todas.
   app.get('/bookings/leads', { preHandler: [guard('reception:read')] }, async (req: any) => {
     return withTenant(req.user.tid, async (tx) => {
       const podeVerTudo = can(req.user.perms, 'jobdelete:any') || can(req.user.perms, 'reception:create')
       const rows = await tx`
-        select jo.id, jo.number, jo.customer_name, jo.customer_phone, jo.booking_note,
-               jo.booking_make, jo.booking_model,
-               jo.booking_date, jo.assigned_to, jo.created_at,
+        select qb.id, qb.customer_name, qb.customer_phone, qb.make, qb.model, qb.note,
+               qb.booking_date, qb.assigned_to, qb.created_at,
                cu.full_name as created_by_name, au.full_name as assigned_to_name
-        from job_orders jo
-        left join users cu on cu.id = jo.booking_created_by
-        left join users au on au.id = jo.assigned_to
-        where jo.tenant_id = ${req.user.tid} and jo.booking_status = 'lead'
-          and (${podeVerTudo} or jo.assigned_to = ${req.user.sub})
-        order by jo.booking_date nulls last, jo.created_at`
+        from quick_bookings qb
+        left join users cu on cu.id = qb.created_by
+        left join users au on au.id = qb.assigned_to
+        where qb.tenant_id = ${req.user.tid} and qb.status = 'pending'
+          and (${podeVerTudo} or qb.assigned_to = ${req.user.sub})
+        order by qb.booking_date nulls last, qb.created_at`
       return { data: rows }
     })
   })
 
-  // Contador para o menu/dashboard.
   app.get('/bookings/leads/count', { preHandler: [guard('reception:read')] }, async (req: any) => {
     return withTenant(req.user.tid, async (tx) => {
       const podeVerTudo = can(req.user.perms, 'jobdelete:any') || can(req.user.perms, 'reception:create')
       const [r] = await tx`
-        select count(*)::int as n from job_orders
-        where tenant_id = ${req.user.tid} and booking_status = 'lead'
+        select count(*)::int as n from quick_bookings
+        where tenant_id = ${req.user.tid} and status = 'pending'
           and (${podeVerTudo} or assigned_to = ${req.user.sub})`
       return { count: r?.n || 0 }
+    })
+  })
+
+  // Marcar uma marcação como tratada (quando o Yury a converte em recepção).
+  app.post('/bookings/leads/:id/done', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+    return withTenant(req.user.tid, async (tx) => {
+      await tx`update quick_bookings set status = 'done', updated_at = now()
+               where id = ${req.params.id} and tenant_id = ${req.user.tid}`
+      return reply.send({ ok: true })
     })
   })
 }
