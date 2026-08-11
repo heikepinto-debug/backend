@@ -241,6 +241,7 @@ export async function receptionRoutes(app: FastifyInstance) {
             update job_orders set
               business_unit_id = ${d.businessUnitId}, customer_id = ${customerId}, vehicle_id = ${vehicleId},
               status = 'awaiting_diagnosis', source = ${d.source},
+              booking_status = case when booking_status = 'lead' then null else booking_status end,
               km_entry = ${d.kmEntry}, fuel_level = ${d.fuelLevel},
               declared_valuables = ${d.declaredValuables},
               checklist = ${JSON.stringify(d.checklist)}, damage_zones = ${JSON.stringify(d.damageZones)},
@@ -1095,5 +1096,78 @@ export async function receptionRoutes(app: FastifyInstance) {
       }
     }
     return reply.send({ results })
+  })
+
+  // ── MARCAÇÃO RÁPIDA (lead) ──────────────────────────────────
+  // A dona lança o mínimo (do WhatsApp); o Yury completa depois.
+  app.post('/bookings/quick', { preHandler: [guard('reception:create')] }, async (req: any, reply) => {
+    const b = z.object({
+      customerName: z.string().max(160).nullable().optional(),
+      customerPhone: z.string().max(40).nullable().optional(),
+      make: z.string().max(80).nullable().optional(),
+      model: z.string().max(80).nullable().optional(),
+      note: z.string().min(1).max(600),                 // a queixa — obrigatória
+      bookingDate: z.string().nullable().optional(),
+      assignTo: z.string().uuid().nullable().optional(),
+    }).safeParse(req.body)
+    if (!b.success) return reply.code(400).send({ error: 'Falta a queixa do cliente (o que precisa).' })
+    const d = b.data
+    // Pelo menos um identificador: nome OU contacto.
+    if (!d.customerName?.trim() && !d.customerPhone?.trim()) {
+      return reply.code(400).send({ error: 'Preciso do contacto ou do nome — pelo menos um, para saber de quem é.' })
+    }
+    return withTenant(req.user.tid, async (tx) => {
+      let assignTo = d.assignTo ?? null
+      if (!assignTo) {
+        const [sup] = await tx`
+          select u.id from users u
+          join user_roles ur on ur.user_id = u.id
+          join roles r on r.id = ur.role_id
+          where u.tenant_id = ${req.user.tid} and u.active = true and r.code = 'manager'
+          order by u.created_at limit 1`
+        assignTo = sup?.id ?? null
+      }
+      const [jo] = await tx`
+        insert into job_orders (tenant_id, status, booking_status, customer_name, customer_phone,
+                                booking_make, booking_model,
+                                booking_note, booking_date, assigned_to, booking_created_by, received_by)
+        values (${req.user.tid}, 'draft', 'lead', ${d.customerName?.trim() || null}, ${d.customerPhone?.trim() || null},
+                ${d.make?.trim() || null}, ${d.model?.trim() || null},
+                ${d.note.trim()}, ${d.bookingDate || null}, ${assignTo}, ${req.user.sub}, ${req.user.sub})
+        returning id, number`
+      await audit(tx, req.user.tid, req.user.sub, 'booking.quick_create', 'job_order', jo.id, { customer: d.customerName || d.customerPhone, assignTo })
+      return reply.send({ ok: true, id: jo.id, number: jo.number, assignedTo: assignTo })
+    })
+  })
+
+  // Lista de marcações "a tratar" (leads). O Yury vê as dele; o dono vê todas.
+  app.get('/bookings/leads', { preHandler: [guard('reception:read')] }, async (req: any) => {
+    return withTenant(req.user.tid, async (tx) => {
+      const podeVerTudo = can(req.user.perms, 'jobdelete:any') || can(req.user.perms, 'reception:create')
+      const rows = await tx`
+        select jo.id, jo.number, jo.customer_name, jo.customer_phone, jo.booking_note,
+               jo.booking_make, jo.booking_model,
+               jo.booking_date, jo.assigned_to, jo.created_at,
+               cu.full_name as created_by_name, au.full_name as assigned_to_name
+        from job_orders jo
+        left join users cu on cu.id = jo.booking_created_by
+        left join users au on au.id = jo.assigned_to
+        where jo.tenant_id = ${req.user.tid} and jo.booking_status = 'lead'
+          and (${podeVerTudo} or jo.assigned_to = ${req.user.sub})
+        order by jo.booking_date nulls last, jo.created_at`
+      return { data: rows }
+    })
+  })
+
+  // Contador para o menu/dashboard.
+  app.get('/bookings/leads/count', { preHandler: [guard('reception:read')] }, async (req: any) => {
+    return withTenant(req.user.tid, async (tx) => {
+      const podeVerTudo = can(req.user.perms, 'jobdelete:any') || can(req.user.perms, 'reception:create')
+      const [r] = await tx`
+        select count(*)::int as n from job_orders
+        where tenant_id = ${req.user.tid} and booking_status = 'lead'
+          and (${podeVerTudo} or assigned_to = ${req.user.sub})`
+      return { count: r?.n || 0 }
+    })
   })
 }
