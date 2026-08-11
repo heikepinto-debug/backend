@@ -215,9 +215,21 @@ export async function osRoutes(app: FastifyInstance) {
           (s as any).workers = workers.filter((w: any) => w.job_service_id === s.id)
             .map((w: any) => ({ userId: w.user_id, name: w.full_name, isHelper: w.is_helper }))
         }
+        // Peças/itens de cada serviço (para a lista de peças a comprar).
+        const allItems = await tx`
+          select id, job_service_id, kind, label, qty, unit,
+                 ${podePreco ? tx`price` : tx`null::numeric`} as price
+          from job_service_items
+          where job_service_id in (select id from job_services where job_order_id = ${joId})
+          order by created_at`
+        for (const s of services) {
+          (s as any).items = allItems.filter((it: any) => it.job_service_id === s.id)
+        }
         // Equipa disponível para escolher (responsável / ajudas).
         const team = await tx`select id, full_name from users where tenant_id = ${req.user.tid} and active = true order by full_name`
-        return { jo, problems, services, team, diagAuthorizationOn: tenant?.diag_authorization_on ?? true }
+        // Catálogo de tipos de serviço (para acrescentar serviços rápido).
+        const serviceTypes = await tx`select id, name from service_types where tenant_id = ${req.user.tid} and active = true order by sort_order, name`
+        return { jo, problems, services, team, serviceTypes, diagAuthorizationOn: tenant?.diag_authorization_on ?? true }
       })
     } catch (e: any) {
       app.log.error({ err: e, joId }, 'os load failed')
@@ -431,6 +443,94 @@ export async function osRoutes(app: FastifyInstance) {
   // ── Itens de acompanhamento aceites num serviço ────────────
   // Materiais e consumíveis que a equipa confirmou ao adicionar o
   // serviço. Alimenta o orçamento. O preço só de pricing:manage.
+  // Total a pagar de um carro — acessível a quem entrega (reception:read),
+  // sem revelar margem/custos. Só o valor que o cliente paga.
+  app.get('/os/:joId/total', { preHandler: [guard('reception:read')] }, async (req: any) => {
+    const { joId } = req.params
+    return withTenant(req.user.tid, async (tx) => {
+      const svcs = await tx`select coalesce(price,0) as price from job_services where job_order_id = ${joId} and tenant_id = ${req.user.tid} and status <> 'not_done'`
+      const items = await tx`select coalesce(i.price,0) as price from job_service_items i
+        join job_services s on s.id = i.job_service_id
+        where s.job_order_id = ${joId} and s.tenant_id = ${req.user.tid} and s.status <> 'not_done'`
+      let total = 0
+      for (const s of svcs) total += Number(s.price) || 0
+      for (const it of items) total += Number(it.price) || 0
+      const [jo] = await tx`select payment_status, paid_amount, paid_method, paid_at from job_orders where id = ${joId} and tenant_id = ${req.user.tid}`
+      return { total, paymentStatus: jo?.payment_status || 'unpaid', paidAmount: jo?.paid_amount ?? null, paidMethod: jo?.paid_method ?? null, paidAt: jo?.paid_at ?? null }
+    })
+  })
+
+  // Marcar um carro como pago (a dona ou o Yury, na entrega).
+  app.post('/os/:joId/pay', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+    const { joId } = req.params
+    const b = z.object({
+      amount: z.number().nonnegative(),
+      method: z.enum(['mpesa', 'emola', 'transfer', 'cash', 'pos']).nullable().optional(),
+      note: z.string().max(300).nullable().optional(),
+    }).safeParse(req.body)
+    if (!b.success) return reply.code(400).send({ error: 'Falta o valor pago.' })
+    const d = b.data
+    return withTenant(req.user.tid, async (tx) => {
+      const [jo] = await tx`select id from job_orders where id = ${joId} and tenant_id = ${req.user.tid}`
+      if (!jo) return reply.code(404).send({ error: 'OS não encontrada' })
+      await tx`insert into payments (tenant_id, job_order_id, amount, method, note, created_by)
+        values (${req.user.tid}, ${joId}, ${d.amount}, ${d.method ?? null}, ${d.note?.trim() || null}, ${req.user.sub})`
+      await tx`update job_orders set payment_status = 'paid', paid_amount = ${d.amount}, paid_method = ${d.method ?? null},
+        paid_at = now(), paid_by = ${req.user.sub} where id = ${joId} and tenant_id = ${req.user.tid}`
+      await audit(tx, req.user.tid, req.user.sub, 'os.paid', 'job_order', joId, { amount: d.amount, method: d.method })
+      return reply.send({ ok: true })
+    })
+  })
+
+  // Desmarcar pago (correção de engano) — só a dona.
+  app.post('/os/:joId/unpay', { preHandler: [guard('pricing:manage')] }, async (req: any, reply) => {
+    const { joId } = req.params
+    return withTenant(req.user.tid, async (tx) => {
+      await tx`update job_orders set payment_status = 'unpaid', paid_amount = null, paid_method = null, paid_at = null, paid_by = null
+        where id = ${joId} and tenant_id = ${req.user.tid}`
+      await audit(tx, req.user.tid, req.user.sub, 'os.unpaid', 'job_order', joId, {})
+      return reply.send({ ok: true })
+    })
+  })
+
+  // Adicionar um SERVIÇO avulso ao carro (não vindo de um problema).
+  // Ex.: o cliente pediu DPF delete — é um serviço a fazer, não um achado.
+  app.post('/os/:joId/services', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+    const { joId } = req.params
+    const b = z.object({
+      typeName: z.string().min(1).max(160),
+      serviceTypeId: z.string().uuid().nullable().optional(),
+      notes: z.string().max(600).nullable().optional(),
+    }).safeParse(req.body)
+    if (!b.success) return reply.code(400).send({ error: 'Falta o nome do serviço.' })
+    const d = b.data
+    return withTenant(req.user.tid, async (tx) => {
+      const [jo] = await tx`select id from job_orders where id = ${joId} and tenant_id = ${req.user.tid}`
+      if (!jo) return reply.code(404).send({ error: 'OS não encontrada' })
+      const [svc] = await tx`
+        insert into job_services (tenant_id, job_order_id, service_type_id, type_name, status, source, notes, created_by)
+        values (${req.user.tid}, ${joId}, ${d.serviceTypeId ?? null}, ${d.typeName.trim()}, 'pending', 'added', ${d.notes?.trim() || null}, ${req.user.sub})
+        returning id`
+      await tx`insert into job_service_transitions (tenant_id, job_service_id, from_status, to_status, reason, changed_by)
+        values (${req.user.tid}, ${svc.id}, null, 'pending', 'Adicionado ao orçamento', ${req.user.sub})`
+      await audit(tx, req.user.tid, req.user.sub, 'os.service_add', 'job_service', svc.id, { nome: d.typeName })
+      return reply.send({ ok: true, serviceId: svc.id })
+    })
+  })
+
+  // Remover um serviço (enquanto não começou).
+  app.delete('/os/services/:sid', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+    return withTenant(req.user.tid, async (tx) => {
+      const [svc] = await tx`select id, status, from_problem_id from job_services where id = ${req.params.sid} and tenant_id = ${req.user.tid}`
+      if (!svc) return reply.code(404).send({ error: 'Serviço não encontrado' })
+      // se veio de um achado, reabre o achado
+      if (svc.from_problem_id) await tx`update problems set status = 'open', resolved_service_id = null where id = ${svc.from_problem_id} and tenant_id = ${req.user.tid}`
+      await tx`delete from job_services where id = ${req.params.sid} and tenant_id = ${req.user.tid}`
+      await audit(tx, req.user.tid, req.user.sub, 'os.service_delete', 'job_service', req.params.sid, {})
+      return reply.send({ ok: true })
+    })
+  })
+
   app.post('/os/services/:sid/items', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
     const { sid } = req.params
     const b = z.object({
