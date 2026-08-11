@@ -24,7 +24,7 @@ export async function qcRoutes(app: FastifyInstance) {
   app.get('/os/:joId/qc', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
     const { joId } = req.params
     return withTenant(req.user.tid, async (tx) => {
-      const [jo] = await tx`select id, status from job_orders where id = ${joId} and tenant_id = ${req.user.tid}`
+      const [jo] = await tx`select id, status, wants_old_parts from job_orders where id = ${joId} and tenant_id = ${req.user.tid}`
       if (!jo) return reply.code(404).send({ error: 'OS não encontrada' })
 
       // Abre o QC se ainda não existir.
@@ -33,7 +33,7 @@ export async function qcRoutes(app: FastifyInstance) {
         [check] = await tx`insert into qc_checks (tenant_id, job_order_id) values (${req.user.tid}, ${joId})
                            returning id, status, reject_reason, approved_at, approved_by`
       }
-      const items = await tx`select id, section, label, required, sort_order from qc_items
+      const items = await tx`select id, section, label, required, conditional_old_parts, sort_order from qc_items
                              where tenant_id = ${req.user.tid} and active = true order by sort_order, label`
       const answers = await tx`select qc_item_id, checked, note from qc_answers where qc_check_id = ${check.id}`
       const byItem: any = {}
@@ -43,7 +43,13 @@ export async function qcRoutes(app: FastifyInstance) {
 
       return {
         check: { ...check, approved_by_name: approver?.full_name || null },
-        items: items.map((it: any) => ({ ...it, answer: byItem[it.id] || { checked: false, note: null } })),
+        wantsOldParts: !!jo?.wants_old_parts,
+        // um item condicional torna-se obrigatório se o cliente pediu as peças
+        items: items.map((it: any) => ({
+          ...it,
+          required: it.required || (it.conditional_old_parts && !!jo?.wants_old_parts),
+          answer: byItem[it.id] || { checked: false, note: null },
+        })),
       }
     })
   })
@@ -77,7 +83,18 @@ export async function qcRoutes(app: FastifyInstance) {
       const obrig = await tx`select id from qc_items where tenant_id = ${req.user.tid} and active = true and required = true`
       const marcados = await tx`select qc_item_id from qc_answers where qc_check_id = ${check.id} and checked = true`
       const setMarcados = new Set(marcados.map((m: any) => m.qc_item_id))
-      const faltam = obrig.filter((i: any) => !setMarcados.has(i.id))
+      let faltam = obrig.filter((i: any) => !setMarcados.has(i.id))
+
+      // Regra CONDICIONAL: se o cliente pediu as peças antigas na
+      // entrada (wants_old_parts), o item marcado como
+      // conditional_old_parts passa a obrigatório para este carro.
+      const [jo] = await tx`select wants_old_parts from job_orders where id = ${joId} and tenant_id = ${req.user.tid}`
+      if (jo?.wants_old_parts) {
+        const cond = await tx`select id from qc_items where tenant_id = ${req.user.tid} and active = true and conditional_old_parts = true`
+        for (const c of cond) {
+          if (!setMarcados.has(c.id) && !faltam.some((f: any) => f.id === c.id)) faltam.push(c)
+        }
+      }
       if (faltam.length) return reply.code(400).send({ error: 'Faltam verificações obrigatórias', missing: faltam.length })
 
       await tx`update qc_checks set status = 'approved', approved_by = ${req.user.sub}, approved_at = now(), reject_reason = null where id = ${check.id}`
