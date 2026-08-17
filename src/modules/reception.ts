@@ -145,7 +145,7 @@ export async function receptionRoutes(app: FastifyInstance) {
         select id, full_name, phone, email,
           (select count(*) from job_orders jo where jo.customer_id = c.id) as visits
         from customers c
-        where full_name ilike ${'%' + q + '%'} or phone ilike ${'%' + q + '%'}
+        where unaccent(full_name) ilike unaccent(${'%' + q + '%'}) or phone ilike ${'%' + q + '%'}
         order by full_name limit 10`
       return { data: rows }
     })
@@ -721,7 +721,7 @@ export async function receptionRoutes(app: FastifyInstance) {
           and (${like}::text is null
                or v.plate ilike ${like}
                or v.plate_norm like ${likeNorm}
-               or c.full_name ilike ${like}
+               or unaccent(c.full_name) ilike unaccent(${like})
                or jo.number ilike ${like})
         order by jo.received_at desc
         limit ${Math.min(Number(q.limit) || 50, 100)}`
