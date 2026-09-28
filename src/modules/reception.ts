@@ -489,11 +489,22 @@ export async function receptionRoutes(app: FastifyInstance) {
       let arrumados = { servicos: 0, achados: 0, diagnostico: false }
       if (status === 'delivered' && force) {
         // serviços que não estão num estado terminal → fechados à força
+        // (job_services não tem updated_at — o rasto fica em job_service_transitions)
         const svc = await tx`
-          update job_services set status = 'done', updated_at = now()
-          where job_order_id = ${joId} and tenant_id = ${req.user.tid}
-            and status not in ('done','not_done')
-          returning id`
+          with alvo as (
+            select id, status from job_services
+            where job_order_id = ${joId} and tenant_id = ${req.user.tid}
+              and status not in ('done','not_done')
+            for update
+          ), fechados as (
+            update job_services s set status = 'done'
+            from alvo where s.id = alvo.id
+            returning s.id, alvo.status as de
+          )
+          insert into job_service_transitions (tenant_id, job_service_id, from_status, to_status, reason, changed_by)
+          select ${req.user.tid}, id, de, 'done', 'Fechado à força na finalização do carro', ${req.user.sub}
+          from fechados
+          returning job_service_id as id`
         arrumados.servicos = svc.length
         // achados de diagnóstico ainda por decidir → dispensados
         const ach = await tx`
