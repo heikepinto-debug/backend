@@ -93,6 +93,10 @@ export async function adminRoutes(app: FastifyInstance) {
             (${tid}, 'Oficina', 'oficina', 1),
             (${tid}, 'Loja', 'loja', 2)
           on conflict (tenant_id, slug) do nothing`
+        await tx`update departments set tracks_vehicles = false where tenant_id = ${tid} and slug = 'loja'`
+
+        // 4b) Plano de categorias financeiras genérico (o dono ajusta depois).
+        await tx`select seed_ledger_categories(${tid})`
 
         // 5) Checklist de QC base (os mesmos 20 itens de referência).
         await tx`
