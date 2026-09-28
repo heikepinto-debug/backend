@@ -5,6 +5,7 @@
 //   · submeter diagnóstico → autorização (Edgar) → autoriza/recusa
 //   · tudo configurável (etapa de autorização liga/desliga por oficina)
 // ============================================================
+import { syncCarPaymentToLedger } from './ledger.js'
 import { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import { withTenant, audit, can, supabase, BUCKET } from '../lib/core.js'
@@ -497,6 +498,7 @@ export async function osRoutes(app: FastifyInstance) {
         values (${req.user.tid}, ${joId}, ${d.amount}, ${d.method ?? null}, ${d.note?.trim() || null}, ${req.user.sub})`
       await tx`update job_orders set payment_status = 'paid', paid_amount = ${d.amount}, paid_method = ${d.method ?? null},
         paid_at = now(), paid_by = ${req.user.sub} where id = ${joId} and tenant_id = ${req.user.tid}`
+      await syncCarPaymentToLedger(tx, req.user.tid, joId, req.user.sub, d.amount, d.method ?? null)
       await audit(tx, req.user.tid, req.user.sub, 'os.paid', 'job_order', joId, { amount: d.amount, method: d.method })
       return reply.send({ ok: true })
     })
@@ -508,6 +510,7 @@ export async function osRoutes(app: FastifyInstance) {
     return withTenant(req.user.tid, async (tx) => {
       await tx`update job_orders set payment_status = 'unpaid', paid_amount = null, paid_method = null, paid_at = null, paid_by = null
         where id = ${joId} and tenant_id = ${req.user.tid}`
+      await syncCarPaymentToLedger(tx, req.user.tid, joId, req.user.sub, null, null)
       await audit(tx, req.user.tid, req.user.sub, 'os.unpaid', 'job_order', joId, {})
       return reply.send({ ok: true })
     })
