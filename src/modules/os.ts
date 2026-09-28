@@ -243,6 +243,26 @@ export async function osRoutes(app: FastifyInstance) {
   // ── Marcar o carro como pronto (confirmado pelo utilizador) ─
   // Sugerido pela app quando todos os serviços fecham, mas é sempre
   // uma decisão humana — a app não muda a fase do carro sozinha.
+  // Iniciar o QC de saída a partir de QUALQUER estádio. O QC é sempre o
+  // mesmo (completo) — isto só torna o QC acessível sem depender do fluxo
+  // ter empurrado o carro até aqui, para não prender carros. Fica rasto
+  // de onde veio.
+  app.post('/os/:joId/start-qc', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+    const { joId } = req.params
+    return withTenant(req.user.tid, async (tx) => {
+      const [jo] = await tx`select id, number, status from job_orders where id = ${joId} and tenant_id = ${req.user.tid}`
+      if (!jo) return reply.code(404).send({ error: 'OS não encontrada' })
+      if (jo.status === 'delivered') return reply.code(409).send({ error: 'O carro já foi entregue' })
+      if (jo.status === 'cancelled') return reply.code(409).send({ error: 'O carro está cancelado' })
+      if (jo.status === 'quality_check') return reply.send({ ok: true, already: true })
+      const anterior = jo.status
+      await tx`update job_orders set status = 'quality_check', updated_at = now() where id = ${joId}`
+      await logState(tx, req.user.tid, joId, anterior, 'quality_check', req.user.sub)
+      await audit(tx, req.user.tid, req.user.sub, 'os.start_qc', 'job_order', joId, { number: jo.number, de: anterior })
+      return reply.send({ ok: true, de: anterior })
+    })
+  })
+
   app.post('/os/:joId/mark-ready', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
     const { joId } = req.params
     return withTenant(req.user.tid, async (tx) => {

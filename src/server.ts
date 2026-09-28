@@ -18,6 +18,7 @@ import { supplierRoutes } from './modules/suppliers.js'
 import { qcRoutes } from './modules/qc.js'
 import { adminRoutes } from './modules/admin.js'
 import { skillRoutes } from './modules/skills.js'
+import { ledgerRoutes } from './modules/ledger.js'
 import { sql } from './lib/core.js'
 
 const app = Fastify({ logger: { level: process.env.NODE_ENV === 'production' ? 'warn' : 'info' } })
@@ -70,6 +71,7 @@ await app.register(supplierRoutes, { prefix: '/api/v1' })
 await app.register(qcRoutes, { prefix: '/api/v1' })
 await app.register(adminRoutes, { prefix: '/api/v1' })
 await app.register(skillRoutes, { prefix: '/api/v1' })
+await app.register(ledgerRoutes, { prefix: '/api/v1' })
 
 app.get('/health', async () => ({ ok: true, product: 'OficinaHub', version: '1.0.0' }))
 
