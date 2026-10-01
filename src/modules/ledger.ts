@@ -170,18 +170,19 @@ export async function ledgerRoutes(app: FastifyInstance) {
       const [{ n: naOficina }] = await tx`select count(*)::int as n from job_orders where tenant_id = ${tid}
         and status not in ('delivered','cancelled','draft')`
 
-      // Serviços com mais margem (carros pagos neste mês). Custo = custos EXTERNOS
-      // (fornecimentos internos entre departamentos anulam-se dentro de casa).
-      const servicos = await tx`
-        select s.type_name as nome, count(*)::int as n,
-          sum(coalesce(s.price,0) + coalesce((select sum(coalesce(i.price,0)) from job_service_items i where i.job_service_id = s.id),0)) as receita,
-          sum(coalesce((select sum(sc.amount) from service_costs sc where sc.job_service_id = s.id and sc.supplier_department_id is null),0)) as custo
-        from job_services s join job_orders jo on jo.id = s.job_order_id
-        where jo.tenant_id = ${tid} and jo.paid_at >= ${from}::date and jo.paid_at < ${to}::date and s.status <> 'not_done'
-        group by s.type_name`
-      const topServicos = servicos.map((x: any) => ({ nome: x.nome, n: x.n, receita: Number(x.receita), custo: Number(x.custo),
-          margem: Number(x.receita) - Number(x.custo) }))
-        .filter((x: any) => x.receita > 0 || x.custo > 0).sort((a: any, b: any) => b.margem - a.margem).slice(0, 8)
+      // Carros com mais margem (pagos neste mês): cobrado = valor pago;
+      // gasto = tudo o que se lançou para o carro (em qualquer mês).
+      const carros = await tx`
+        select jo.id, jo.number, v.plate, coalesce(jo.paid_amount, 0) as cobrado,
+          coalesce((select sum(le.cost) from ledger_entries le left join ledger_categories c on c.id = le.category_id
+                    where le.job_order_id = jo.id and le.tenant_id = ${tid} and le.ignored = false
+                      and coalesce(c.counts_in_result, true)), 0) as gasto
+        from job_orders jo left join vehicles v on v.id = jo.vehicle_id
+        where jo.tenant_id = ${tid} and jo.payment_status = 'paid'
+          and jo.paid_at >= ${from}::date and jo.paid_at < ${to}::date`
+      const topCarros = carros.map((x: any) => ({ id: x.id, number: x.number, plate: x.plate,
+          cobrado: Number(x.cobrado), gasto: Number(x.gasto), margem: Number(x.cobrado) - Number(x.gasto) }))
+        .sort((a: any, b: any) => b.margem - a.margem).slice(0, 8)
 
       return {
         month, receitas, despesas, resultado: receitas - despesas,
@@ -191,8 +192,61 @@ export async function ledgerRoutes(app: FastifyInstance) {
         caixaPorValidar: { n: caixaN, valor: caixaV },
         meses, porReceber: porReceber.map((x: any) => ({ ...x, total: Number(x.total) })),
         totalPorReceber: porReceber.reduce((a: number, x: any) => a + Number(x.total), 0),
-        naOficina, topServicos,
+        naOficina, topCarros,
       }
+    })
+  })
+
+  // ── Carros para ligar um lançamento (os que estão na oficina,
+  //    mais os entregues nos últimos 30 dias). Procura por matrícula,
+  //    número ou cliente, ignorando acentos e hífens.
+  app.get('/ledger/cars', { preHandler: [guard('pricing:manage')] }, async (req: any) => {
+    const q = String((req.query as any).q || '').trim()
+    const like = q ? `%${q}%` : null
+    const likeNorm = q ? `%${q.toUpperCase().replace(/[^A-Z0-9]/g, '')}%` : null
+    return withTenant(req.user.tid, async (tx) => {
+      const rows = await tx`
+        select jo.id, jo.number, jo.status, v.plate, v.brand, v.model, c.full_name as customer
+        from job_orders jo
+        left join vehicles v on v.id = jo.vehicle_id
+        left join customers c on c.id = jo.customer_id
+        where jo.tenant_id = ${req.user.tid}
+          and jo.status not in ('cancelled','draft')
+          and (jo.status <> 'delivered' or jo.updated_at > now() - interval '30 days')
+          and (${like}::text is null
+               or v.plate ilike ${like} or v.plate_norm like ${likeNorm}
+               or jo.number ilike ${like}
+               or unaccent(coalesce(c.full_name,'')) ilike unaccent(${like}))
+        order by (jo.status = 'delivered'), jo.received_at desc
+        limit 30`
+      return { cars: rows }
+    })
+  })
+
+  // ── Gastos de um carro (para a OS): o que lancei para ele, o que
+  //    recebi e o valor a cobrar. É o único sítio dos gastos do carro.
+  app.get('/ledger/car/:joId', { preHandler: [guard('pricing:manage')] }, async (req: any, reply) => {
+    const { joId } = req.params
+    return withTenant(req.user.tid, async (tx) => {
+      const [jo] = await tx`select id from job_orders where id = ${joId} and tenant_id = ${req.user.tid}`
+      if (!jo) return reply.code(404).send({ error: 'Carro não encontrado' })
+      const entries = await tx`
+        select le.id, le.entry_date, le.cost, le.revenue, le.description, le.counterparty, le.payment_method, le.source,
+               le.category_id, c.name as category_name, c.flow, coalesce(c.counts_in_result, true) as counts_in_result,
+               le.department_id, d.name as department, le.is_transversal, le.validated,
+               le.job_order_id, le.plate, le.make, le.model, le.engine
+        from ledger_entries le
+        left join ledger_categories c on c.id = le.category_id
+        left join departments d on d.id = le.department_id
+        where le.tenant_id = ${req.user.tid} and le.job_order_id = ${joId} and le.ignored = false
+        order by le.entry_date, le.created_at`
+      const gasto = entries.filter((e: any) => e.counts_in_result).reduce((a: number, e: any) => a + Number(e.cost || 0), 0)
+      const recebido = entries.filter((e: any) => e.counts_in_result).reduce((a: number, e: any) => a + Number(e.revenue || 0), 0)
+      const [{ preco }] = await tx`
+        select coalesce((select sum(coalesce(s.price,0)) from job_services s where s.job_order_id = ${joId} and s.status <> 'not_done'),0)
+             + coalesce((select sum(coalesce(i.price,0)) from job_service_items i join job_services s on s.id = i.job_service_id
+                         where s.job_order_id = ${joId} and s.status <> 'not_done'),0) as preco`
+      return { entries, gasto, recebido, preco: Number(preco) }
     })
   })
 
@@ -240,6 +294,12 @@ export async function ledgerRoutes(app: FastifyInstance) {
       if (!cat) return reply.code(400).send({ error: 'Categoria inválida.' })
       const erro = validar(cat, d)
       if (erro) return reply.code(400).send({ error: erro })
+      if (d.jobOrderId) {
+        const [car] = await tx`select v.plate, v.brand, v.model from job_orders jo left join vehicles v on v.id = jo.vehicle_id
+                               where jo.id = ${d.jobOrderId} and jo.tenant_id = ${req.user.tid}`
+        if (!car) return reply.code(400).send({ error: 'Esse carro não existe nesta oficina.' })
+        d.plate = d.plate || car.plate; d.make = d.make || car.brand; d.model = d.model || car.model
+      }
       const neutral = cat.flow === 'neutral'
       const transv = !neutral && !!d.isTransversal
       const [e] = await tx`
@@ -260,7 +320,7 @@ export async function ledgerRoutes(app: FastifyInstance) {
   // Listar (por período e departamento). Base do painel e da conciliação.
   app.get('/ledger', { preHandler: [guard('pricing:manage')] }, async (req: any) => {
     const q = req.query as any
-    const from = q.from || null, to = q.to || null, dept = q.departmentId || null
+    const from = q.from || null, to = q.to || null, dept = q.departmentId || null, jo = q.jobOrderId || null
     return withTenant(req.user.tid, async (tx) => {
       const rows = await tx`
         select le.id, le.entry_date, le.department_id, d.name as department, le.is_transversal,
@@ -275,6 +335,7 @@ export async function ledgerRoutes(app: FastifyInstance) {
           and (${from}::date is null or le.entry_date >= ${from}::date)
           and (${to}::date is null or le.entry_date <= ${to}::date)
           and (${dept}::uuid is null or le.department_id = ${dept}::uuid)
+          and (${jo}::uuid is null or le.job_order_id = ${jo}::uuid)
         order by le.entry_date desc, le.created_at desc`
       return { entries: rows }
     })
@@ -298,6 +359,14 @@ export async function ledgerRoutes(app: FastifyInstance) {
         departmentId: v('departmentId', 'department_id'), isTransversal: v('isTransversal', 'is_transversal'),
       }
       if (cat) { const erro = validar(cat, merged); if (erro) return reply.code(400).send({ error: erro }) }
+      if (d.jobOrderId) {
+        const [car] = await tx`select v.plate, v.brand, v.model from job_orders jo left join vehicles v on v.id = jo.vehicle_id
+                               where jo.id = ${d.jobOrderId} and jo.tenant_id = ${req.user.tid}`
+        if (!car) return reply.code(400).send({ error: 'Esse carro não existe nesta oficina.' })
+        if (d.plate === undefined || d.plate === null) d.plate = car.plate
+        if (d.make === undefined || d.make === null) d.make = car.brand
+        if (d.model === undefined || d.model === null) d.model = car.model
+      }
       const neutral = cat?.flow === 'neutral'
       const transv = !neutral && !!merged.isTransversal
       await tx`update ledger_entries set
