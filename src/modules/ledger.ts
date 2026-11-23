@@ -13,7 +13,7 @@
 // ============================================================
 import { FastifyInstance } from 'fastify'
 import { z } from 'zod'
-import { withTenant, audit, can } from '../lib/core.js'
+import { withTenant, audit, can, supabase, BUCKET } from '../lib/core.js'
 
 function guard(perm: string) {
   return async (req: any, reply: any) => {
@@ -21,6 +21,18 @@ function guard(perm: string) {
     if (!can(req.user.perms, perm)) return reply.code(403).send({ error: 'Sem permissão', needed: perm })
   }
 }
+
+// Lançar: o dono (pricing:manage) vê e mexe em tudo; quem tem só
+// ledger:own lança e vê APENAS os seus lançamentos, que ficam por
+// validar. Sem totais nem painel.
+function guardLedger() {
+  return async (req: any, reply: any) => {
+    try { await req.jwtVerify() } catch { return reply.code(401).send({ error: 'Não autenticado' }) }
+    if (!can(req.user.perms, 'pricing:manage') && !can(req.user.perms, 'ledger:own'))
+      return reply.code(403).send({ error: 'Sem permissão', needed: 'ledger:own' })
+  }
+}
+const eDono = (req: any) => can(req.user.perms, 'pricing:manage')
 
 const METHODS = ['bank', 'cash', 'mpesa', 'emola', 'card'] as const
 
@@ -110,7 +122,7 @@ export async function ledgerRoutes(app: FastifyInstance) {
         select le.department_id, le.is_transversal, le.cost, le.revenue, le.payment_method, le.validated,
                c.nature, c.group_name, coalesce(c.counts_in_result, true) as counts
         from ledger_entries le left join ledger_categories c on c.id = le.category_id
-        where le.tenant_id = ${tid} and le.ignored = false
+        where le.tenant_id = ${tid} and le.ignored = false and le.pending_review = false
           and le.entry_date >= ${from}::date and le.entry_date < ${to}::date`
 
       let receitas = 0, despesas = 0, transv = 0, fixos = 0, variaveis = 0, semNatureza = 0, internos = 0
@@ -145,7 +157,7 @@ export async function ledgerRoutes(app: FastifyInstance) {
       const hist = await tx`
         select to_char(le.entry_date, 'YYYY-MM') as m, sum(le.revenue) as rev, sum(le.cost) as cost
         from ledger_entries le left join ledger_categories c on c.id = le.category_id
-        where le.tenant_id = ${tid} and le.ignored = false and coalesce(c.counts_in_result, true)
+        where le.tenant_id = ${tid} and le.ignored = false and le.pending_review = false and coalesce(c.counts_in_result, true)
           and le.entry_date >= (${from}::date - interval '5 months') and le.entry_date < ${to}::date
         group by 1`
       const meses: any[] = []
@@ -200,7 +212,7 @@ export async function ledgerRoutes(app: FastifyInstance) {
   // ── Carros para ligar um lançamento (os que estão na oficina,
   //    mais os entregues nos últimos 30 dias). Procura por matrícula,
   //    número ou cliente, ignorando acentos e hífens.
-  app.get('/ledger/cars', { preHandler: [guard('pricing:manage')] }, async (req: any) => {
+  app.get('/ledger/cars', { preHandler: [guardLedger()] }, async (req: any) => {
     const q = String((req.query as any).q || '').trim()
     const like = q ? `%${q}%` : null
     const likeNorm = q ? `%${q.toUpperCase().replace(/[^A-Z0-9]/g, '')}%` : null
@@ -234,10 +246,12 @@ export async function ledgerRoutes(app: FastifyInstance) {
         select le.id, le.entry_date, le.cost, le.revenue, le.description, le.counterparty, le.payment_method, le.source,
                le.category_id, c.name as category_name, c.flow, coalesce(c.counts_in_result, true) as counts_in_result,
                le.department_id, d.name as department, le.is_transversal, le.validated,
+               le.pending_review, (le.receipt_path is not null) as has_receipt, u.full_name as created_by_name,
                le.job_order_id, le.plate, le.make, le.model, le.engine
         from ledger_entries le
         left join ledger_categories c on c.id = le.category_id
         left join departments d on d.id = le.department_id
+        left join users u on u.id = le.created_by
         where le.tenant_id = ${req.user.tid} and le.job_order_id = ${joId} and le.ignored = false
         order by le.entry_date, le.created_at`
       const gasto = entries.filter((e: any) => e.counts_in_result).reduce((a: number, e: any) => a + Number(e.cost || 0), 0)
@@ -267,7 +281,7 @@ export async function ledgerRoutes(app: FastifyInstance) {
   })
 
   // Departamentos (Oficina/Remaps/Loja) — os mesmos da margem.
-  app.get('/ledger/departments', { preHandler: [guard('pricing:manage')] }, async (req: any) => {
+  app.get('/ledger/departments', { preHandler: [guardLedger()] }, async (req: any) => {
     return withTenant(req.user.tid, async (tx) => {
       const rows = await tx`select id, name, slug, tracks_vehicles, overhead_share from departments
                             where tenant_id = ${req.user.tid} and active = true order by sort_order, name`
@@ -276,24 +290,34 @@ export async function ledgerRoutes(app: FastifyInstance) {
   })
 
   // Plano de categorias da oficina.
-  app.get('/ledger/categories', { preHandler: [guard('pricing:manage')] }, async (req: any) => {
+  app.get('/ledger/categories', { preHandler: [guardLedger()] }, async (req: any) => {
     return withTenant(req.user.tid, async (tx) => {
-      const rows = await tx`select id, flow, group_name, name, nature, counts_in_result from ledger_categories
+      const rows = await tx`select id, flow, group_name, name, nature, counts_in_result, team_visible from ledger_categories
                             where tenant_id = ${req.user.tid} and active = true order by flow, sort_order, name`
-      return { categories: rows }
+      if (eDono(req)) return { categories: rows }
+      // A equipa vê só as categorias que o dono abriu para ela (por defeito,
+      // as do dia-a-dia). Se nenhuma estiver marcada, vê todas menos as internas.
+      const abertas = rows.filter((c: any) => c.team_visible && c.flow !== 'neutral')
+      return { categories: abertas.length ? abertas : rows.filter((c: any) => c.flow !== 'neutral') }
     })
   })
 
   // Lançar (Ponta A — no dia-a-dia).
-  app.post('/ledger', { preHandler: [guard('pricing:manage')] }, async (req: any, reply) => {
+  app.post('/ledger', { preHandler: [guardLedger()] }, async (req: any, reply) => {
     const p = entrySchema.safeParse(req.body)
     if (!p.success) return reply.code(400).send({ error: 'Escolhe a categoria e escreve o valor.' })
     const d = p.data
     return withTenant(req.user.tid, async (tx) => {
-      const [cat] = await tx`select id, flow, name from ledger_categories where id = ${d.categoryId} and tenant_id = ${req.user.tid}`
+      const [cat] = await tx`select id, flow, name, team_visible from ledger_categories where id = ${d.categoryId} and tenant_id = ${req.user.tid}`
       if (!cat) return reply.code(400).send({ error: 'Categoria inválida.' })
       const erro = validar(cat, d)
       if (erro) return reply.code(400).send({ error: erro })
+      const dono = eDono(req)
+      if (!dono && !cat.team_visible) {
+        const [{ n }] = await tx`select count(*)::int as n from ledger_categories where tenant_id = ${req.user.tid} and active = true and team_visible = true`
+        if (n > 0) return reply.code(403).send({ error: 'Essa categoria é lançada pelo dono.' })
+      }
+      if (!dono && cat.flow === 'neutral') return reply.code(403).send({ error: 'Movimentos internos são lançados pelo dono.' })
       if (d.jobOrderId) {
         const [car] = await tx`select v.plate, v.brand, v.model from job_orders jo left join vehicles v on v.id = jo.vehicle_id
                                where jo.id = ${d.jobOrderId} and jo.tenant_id = ${req.user.tid}`
@@ -305,30 +329,36 @@ export async function ledgerRoutes(app: FastifyInstance) {
       const [e] = await tx`
         insert into ledger_entries (tenant_id, entry_date, department_id, is_transversal, category_id, category,
           payment_method, description, counterparty, job_order_id, plate, make, model, engine,
-          cost, revenue, source, created_by)
+          cost, revenue, source, created_by, pending_review)
         values (${req.user.tid}, ${d.entryDate || new Date().toISOString().slice(0, 10)},
           ${neutral || transv ? null : d.departmentId}, ${transv}, ${cat.id}, ${cat.name},
           ${d.paymentMethod ?? null}, ${d.description?.trim() || null}, ${d.counterparty?.trim() || null},
           ${d.jobOrderId ?? null}, ${d.plate?.trim() || null}, ${d.make?.trim() || null}, ${d.model?.trim() || null}, ${d.engine?.trim() || null},
-          ${d.cost ?? 0}, ${d.revenue ?? 0}, 'app', ${req.user.sub})
+          ${d.cost ?? 0}, ${d.revenue ?? 0}, 'app', ${req.user.sub}, ${!dono})
         returning id`
       await audit(tx, req.user.tid, req.user.sub, 'ledger.create', 'ledger_entry', e.id, { categoria: cat.name, cost: d.cost, revenue: d.revenue })
-      return reply.send({ ok: true, id: e.id })
+      return reply.send({ ok: true, id: e.id, pendingReview: !dono })
     })
   })
 
   // Listar (por período e departamento). Base do painel e da conciliação.
-  app.get('/ledger', { preHandler: [guard('pricing:manage')] }, async (req: any) => {
+  app.get('/ledger', { preHandler: [guardLedger()] }, async (req: any) => {
     const q = req.query as any
     const from = q.from || null, to = q.to || null, dept = q.departmentId || null, jo = q.jobOrderId || null
+    const dono = eDono(req)
+    // Quem não é dono vê só o que lançou (e nunca os pagamentos automáticos dos carros).
+    const meu = dono ? null : req.user.sub
+    const soPendentes = dono && q.pending === '1'
     return withTenant(req.user.tid, async (tx) => {
       const rows = await tx`
         select le.id, le.entry_date, le.department_id, d.name as department, le.is_transversal,
                le.category_id, c.name as category_name, c.group_name, c.flow, c.nature, c.counts_in_result,
                le.payment_method, le.description, le.counterparty,
                le.job_order_id, le.plate, le.make, le.model, le.engine,
-               le.cost, le.revenue, le.source, le.reconciled, le.validated, le.ignored, le.created_at
+               le.cost, le.revenue, le.source, le.reconciled, le.validated, le.ignored, le.created_at,
+               le.pending_review, (le.receipt_path is not null) as has_receipt, le.created_by, u.full_name as created_by_name
         from ledger_entries le
+        left join users u on u.id = le.created_by
         left join departments d on d.id = le.department_id
         left join ledger_categories c on c.id = le.category_id
         where le.tenant_id = ${req.user.tid}
@@ -336,13 +366,16 @@ export async function ledgerRoutes(app: FastifyInstance) {
           and (${to}::date is null or le.entry_date <= ${to}::date)
           and (${dept}::uuid is null or le.department_id = ${dept}::uuid)
           and (${jo}::uuid is null or le.job_order_id = ${jo}::uuid)
-        order by le.entry_date desc, le.created_at desc`
+          and (${meu}::uuid is null or (le.created_by = ${meu}::uuid and le.source = 'app'))
+          and (${soPendentes} = false or le.pending_review = true)
+        order by le.entry_date desc, le.created_at desc
+        limit ${dono ? 2000 : 60}`
       return { entries: rows }
     })
   })
 
   // Editar (detalhar, reclassificar, conciliar, validar, ignorar).
-  app.patch('/ledger/:id', { preHandler: [guard('pricing:manage')] }, async (req: any, reply) => {
+  app.patch('/ledger/:id', { preHandler: [guardLedger()] }, async (req: any, reply) => {
     const p = entrySchema.partial().extend({
       reconciled: z.boolean().optional(), validated: z.boolean().optional(), ignored: z.boolean().optional(),
     }).safeParse(req.body)
@@ -351,6 +384,11 @@ export async function ledgerRoutes(app: FastifyInstance) {
     return withTenant(req.user.tid, async (tx) => {
       const [ex] = await tx`select * from ledger_entries where id = ${req.params.id} and tenant_id = ${req.user.tid}`
       if (!ex) return reply.code(404).send({ error: 'Lançamento não encontrado' })
+      if (!eDono(req)) {
+        if (ex.created_by !== req.user.sub || ex.source !== 'app') return reply.code(404).send({ error: 'Lançamento não encontrado' })
+        if (!ex.pending_review) return reply.code(409).send({ error: 'Este lançamento já foi validado — só o dono o pode alterar.' })
+        delete d.reconciled; delete d.validated; delete d.ignored
+      }
       const v = (key: string, col: string) => d[key] !== undefined ? d[key] : ex[col]
       const catId = v('categoryId', 'category_id')
       const [cat] = catId ? await tx`select id, flow, name from ledger_categories where id = ${catId} and tenant_id = ${req.user.tid}` : [null]
@@ -387,11 +425,63 @@ export async function ledgerRoutes(app: FastifyInstance) {
   })
 
   // Apagar (engano).
-  app.delete('/ledger/:id', { preHandler: [guard('pricing:manage')] }, async (req: any, reply) => {
+  app.delete('/ledger/:id', { preHandler: [guardLedger()] }, async (req: any, reply) => {
     return withTenant(req.user.tid, async (tx) => {
+      const [ex] = await tx`select created_by, source, pending_review, receipt_path from ledger_entries where id = ${req.params.id} and tenant_id = ${req.user.tid}`
+      if (!ex) return reply.code(404).send({ error: 'Lançamento não encontrado' })
+      if (!eDono(req)) {
+        if (ex.created_by !== req.user.sub || ex.source !== 'app') return reply.code(404).send({ error: 'Lançamento não encontrado' })
+        if (!ex.pending_review) return reply.code(409).send({ error: 'Este lançamento já foi validado — só o dono o pode apagar.' })
+      }
+      if (ex.receipt_path) { try { await supabase.storage.from(BUCKET).remove([ex.receipt_path]) } catch {} }
       await tx`delete from ledger_entries where id = ${req.params.id} and tenant_id = ${req.user.tid}`
       await audit(tx, req.user.tid, req.user.sub, 'ledger.delete', 'ledger_entry', req.params.id, {})
       return reply.send({ ok: true })
     })
+  })
+
+  // ── Validar um lançamento da equipa (só o dono) ─────────────
+  app.post('/ledger/:id/approve', { preHandler: [guard('pricing:manage')] }, async (req: any, reply) => {
+    return withTenant(req.user.tid, async (tx) => {
+      const r = await tx`update ledger_entries set pending_review = false, reviewed_by = ${req.user.sub}, reviewed_at = now(), updated_at = now()
+                         where id = ${req.params.id} and tenant_id = ${req.user.tid} returning id`
+      if (!r.length) return reply.code(404).send({ error: 'Lançamento não encontrado' })
+      await audit(tx, req.user.tid, req.user.sub, 'ledger.approve', 'ledger_entry', req.params.id, {})
+      return reply.send({ ok: true })
+    })
+  })
+
+  // ── Factura / recibo (foto) ─────────────────────────────────
+  // A imagem vem já reduzida pelo telemóvel. Quem não é dono só
+  // anexa aos seus lançamentos.
+  app.post('/ledger/:id/receipt', { preHandler: [guardLedger()] }, async (req: any, reply) => {
+    const b = z.object({ imageBase64: z.string().min(100).max(1_300_000) }).safeParse(req.body)
+    if (!b.success) return reply.code(400).send({ error: 'Fotografia em falta ou demasiado grande.' })
+    const ex = await withTenant(req.user.tid, async (tx) => {
+      const [e] = await tx`select id, created_by, source, receipt_path from ledger_entries where id = ${req.params.id} and tenant_id = ${req.user.tid}`
+      return e
+    })
+    if (!ex || (!eDono(req) && (ex.created_by !== req.user.sub || ex.source !== 'app')))
+      return reply.code(404).send({ error: 'Lançamento não encontrado' })
+    const path = `${req.user.tid}/ledger/${ex.id}-${Date.now()}.jpg`
+    const { error } = await supabase.storage.from(BUCKET).upload(path, Buffer.from(b.data.imageBase64, 'base64'), { contentType: 'image/jpeg' })
+    if (error) return reply.code(500).send({ error: 'Não foi possível guardar a factura.' })
+    if (ex.receipt_path) { try { await supabase.storage.from(BUCKET).remove([ex.receipt_path]) } catch {} }
+    return withTenant(req.user.tid, async (tx) => {
+      await tx`update ledger_entries set receipt_path = ${path}, updated_at = now() where id = ${ex.id} and tenant_id = ${req.user.tid}`
+      return reply.send({ ok: true })
+    })
+  })
+
+  app.get('/ledger/:id/receipt', { preHandler: [guardLedger()] }, async (req: any, reply) => {
+    const ex = await withTenant(req.user.tid, async (tx) => {
+      const [e] = await tx`select created_by, source, receipt_path from ledger_entries where id = ${req.params.id} and tenant_id = ${req.user.tid}`
+      return e
+    })
+    if (!ex || !ex.receipt_path || (!eDono(req) && (ex.created_by !== req.user.sub || ex.source !== 'app')))
+      return reply.code(404).send({ error: 'Sem factura' })
+    const { data, error } = await supabase.storage.from(BUCKET).createSignedUrl(ex.receipt_path, 3600)
+    if (error || !data?.signedUrl) return reply.code(500).send({ error: 'Não foi possível abrir a factura.' })
+    return { url: data.signedUrl }
   })
 }

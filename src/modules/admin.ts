@@ -103,6 +103,8 @@ export async function adminRoutes(app: FastifyInstance) {
 
         // 4b) Plano de categorias financeiras genérico (o dono ajusta depois).
         await tx`select seed_ledger_categories(${tid})`
+        await tx`update ledger_categories set team_visible = true
+                 where tenant_id = ${tid} and ((flow = 'cost' and group_name = 'Operação') or flow = 'revenue')`
 
         // 5) Checklist de QC base (os mesmos 20 itens de referência).
         await tx`

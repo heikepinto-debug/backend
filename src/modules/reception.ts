@@ -708,6 +708,7 @@ export async function receptionRoutes(app: FastifyInstance) {
                jo.km_entry, jo.received_at, jo.signed_at, jo.deletion_status,
                jo.is_non_runner, jo.entry_pending_reason, jo.entry_completed_at, jo.entry_type,
                jo.payment_status, jo.paid_amount,
+               (select qc.status from qc_checks qc where qc.job_order_id = jo.id limit 1) as qc_status,
                (select count(*) from reception_photos rp
                 where rp.job_order_id = jo.id and rp.is_required = true) as req_photos,
                exists(select 1 from job_services js where js.job_order_id = jo.id

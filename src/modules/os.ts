@@ -161,6 +161,7 @@ export async function osRoutes(app: FastifyInstance) {
       return await withTenant(req.user.tid, async (tx) => {
         const [jo] = await tx`
           select jo.*, v.plate, v.brand, v.model, c.full_name as customer_name,
+                 (select q.status from qc_checks q where q.job_order_id = jo.id and q.tenant_id = jo.tenant_id limit 1) as qc_status,
                  uo.full_name as os_opened_by_name,
                  us.full_name as diag_submitted_by_name,
                  ua.full_name as diag_authorized_by_name
