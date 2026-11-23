@@ -105,15 +105,43 @@ export async function todayRoutes(app: FastifyInstance) {
           and jo.status not in ('draft','delivered','cancelled','ready')`
       if (meus.length) needs.push({ key: 'mine', count: meus.length, cars: meus.slice(0, 3).map(mini) })
 
-      // Parados há mais tempo (3 dias ou mais sem qualquer movimento).
-      const agora = Date.now()
-      const stalled = cars
-        .filter((r: any) => fase(r) !== 'ready')
-        .map((r: any) => ({ ...mini(r), status: r.status, days: Math.floor((agora - new Date(r.last_move).getTime()) / 86400000) }))
-        .filter((r: any) => r.days >= 3)
-        .sort((a: any, b: any) => b.days - a.days).slice(0, 4)
+      // ── PENDENTES PARADOS ──────────────────────────────────────
+      // Carros, marcações e entradas por acabar sem movimento há mais dias
+      // do que o prazo da oficina. Cada um precisa de tratamento: avançar
+      // ou ser justificado (a justificação caduca). Só para quem gere.
+      let stale: any = null
+      if (can(perms, 'os:manage')) {
+        const [{ stale_days: prazo }] = await tx`select stale_days from tenants where id = ${tid}`
+        const agora = Date.now()
+        const dias = (d: any) => Math.floor((agora - new Date(d).getTime()) / 86400000)
+        const drafts = await tx`
+          select jo.id, jo.number, jo.booking_date, jo.updated_at, v.plate, v.brand, v.model, c.full_name as customer
+          from job_orders jo left join vehicles v on v.id = jo.vehicle_id left join customers c on c.id = jo.customer_id
+          where jo.tenant_id = ${tid} and jo.status = 'draft' and coalesce(jo.booking_status, '') <> 'cancelled'`
+        const todos = [
+          ...cars.map((r: any) => ({ ...mini(r), number: r.number, customer: r.customer, status: r.status, kind: 'car', days: dias(r.last_move), since: r.last_move })),
+          ...drafts.map((r: any) => r.booking_date
+            ? { ...mini(r), number: r.number, customer: r.customer, status: 'draft', kind: 'booking', days: dias(r.booking_date), since: r.booking_date }
+            : { ...mini(r), number: r.number, customer: r.customer, status: 'draft', kind: 'draft', days: dias(r.updated_at), since: r.updated_at }),
+        ].filter((r: any) => r.days >= prazo)
+        const acks = todos.length ? await tx`
+          select distinct on (a.job_order_id) a.job_order_id, a.reason, a.note, a.snooze_until, a.created_at, u.full_name as by_name
+          from stale_acks a left join users u on u.id = a.user_id
+          where a.tenant_id = ${tid} and a.job_order_id = any(${todos.map((r: any) => r.id)}) and a.snooze_until > now()
+          order by a.job_order_id, a.created_at desc` : []
+        const porId = new Map<string, any>(acks.map((a: any) => [a.job_order_id, a] as [string, any]))
+        const untreated: any[] = [], treated: any[] = []
+        for (const r of todos.sort((a: any, b: any) => b.days - a.days)) {
+          const a: any = porId.get(r.id)
+          // só vale a justificação dada DEPOIS do último movimento
+          if (a && new Date(a.created_at).getTime() >= new Date(r.since).getTime())
+            treated.push({ ...r, reason: a.reason, note: a.note, until: a.snooze_until, by: a.by_name })
+          else untreated.push(r)
+        }
+        stale = { days: prazo, untreated, treated }
+      }
 
-      return { inShop: cars.length, pipeline, needs, stalled }
+      return { inShop: cars.length, pipeline, needs, stale }
     })
   })
 }

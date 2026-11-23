@@ -54,6 +54,23 @@ export async function withTenant<T>(
 }
 
 // ── Payload do JWT ───────────────────────────────────────────
+// ── Estado da sessão de cada pessoa (activa? permissões mudaram?) ──
+// Lido da base no máximo de 30 em 30 segundos por pessoa. Permite que
+// desactivar alguém, mudar-lhe o papel ou a senha tenha efeito logo,
+// em vez de esperar que o acesso de 8 horas expire.
+const sessCache = new Map<string, { active: boolean; epoch: number; at: number }>()
+export async function sessionState(userId: string): Promise<{ active: boolean; epoch: number } | null> {
+  const c = sessCache.get(userId)
+  if (c && Date.now() - c.at < 30_000) return c
+  try {
+    const [u] = await sql`select u.active and t.active as active, u.session_epoch from users u join tenants t on t.id = u.tenant_id where u.id = ${userId}`
+    const v = { active: !!u?.active, epoch: Number(u?.session_epoch || 0), at: Date.now() }
+    sessCache.set(userId, v)
+    return v
+  } catch { return null }   // base em baixo: não bloquear por causa desta verificação
+}
+export const forgetSession = (userId: string) => { sessCache.delete(userId) }
+
 export interface Jwt {
   sub: string           // user id
   tid: string           // tenant id
@@ -73,6 +90,7 @@ export function can(perms: string[], needed: string): boolean {
 export async function authenticate(email: string, password: string) {
   const [user] = await sql`
     select u.id, u.tenant_id, u.full_name, u.password_hash, u.active, u.platform_admin,
+           u.session_epoch, u.must_change_password,
            t.name as tenant_name, t.slug, t.logo_url,
            t.brand_primary_color, t.brand_secondary_color, t.settings,
            t.active as tenant_active
@@ -99,6 +117,7 @@ export async function authenticate(email: string, password: string) {
 
   return {
     user: { id: user.id, name: user.full_name, email, platformAdmin: !!user.platform_admin },
+    epoch: Number(user.session_epoch || 0), mustChangePassword: !!user.must_change_password,
     tenant: {
       id: user.tenant_id, slug: user.slug, name: user.tenant_name,
       logoUrl: user.logo_url,

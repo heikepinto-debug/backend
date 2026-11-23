@@ -837,7 +837,7 @@ export async function osRoutes(app: FastifyInstance) {
   })
 
   // ── Autorizar o diagnóstico (Edgar, ou quem a oficina definir) ──
-  app.post('/os/:joId/authorize-diagnosis', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+  app.post('/os/:joId/authorize-diagnosis', { preHandler: [guard('os:manage')] }, async (req: any, reply) => {
     const { joId } = req.params
     const b = req.body as any
     return withTenant(req.user.tid, async (tx) => {

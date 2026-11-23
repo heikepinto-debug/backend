@@ -4,7 +4,7 @@
 // ============================================================
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
-import { authenticate, sql, bcrypt } from '../lib/core.js'
+import { authenticate, sql, bcrypt, forgetSession } from '../lib/core.js'
 
 export async function authRoutes(app: FastifyInstance) {
 
@@ -23,7 +23,7 @@ export async function authRoutes(app: FastifyInstance) {
 
     const payload = {
       sub: auth.user.id, tid: auth.tenant.id,
-      perms: auth.perms, name: auth.user.name,
+      perms: auth.perms, name: auth.user.name, ep: auth.epoch,
     }
     const accessToken = app.jwt.sign(payload, { expiresIn: process.env.JWT_EXPIRES || '8h' })
     const refreshToken = app.jwt.sign(
@@ -34,6 +34,7 @@ export async function authRoutes(app: FastifyInstance) {
     return reply.send({
       accessToken, refreshToken,
       user: auth.user,
+      mustChangePassword: auth.mustChangePassword,
       roles: auth.roles,
       permissions: auth.perms,
       tenant: auth.tenant,     // nome, logo, cores, módulos → white-label
@@ -45,20 +46,24 @@ export async function authRoutes(app: FastifyInstance) {
     const body = z.object({ refreshToken: z.string() }).safeParse(req.body)
     if (!body.success) return reply.code(400).send({ error: 'Dados inválidos' })
     try {
-      const dec = app.jwt.verify(body.data.refreshToken) as { sub: string; typ: string }
+      const dec = app.jwt.verify(body.data.refreshToken) as { sub: string; typ: string; iat?: number }
       if (dec.typ !== 'refresh') throw new Error()
       const [u] = await sql`
-        select u.id, u.tenant_id, u.full_name, u.active from users u where u.id = ${dec.sub}`
-      if (!u?.active) return reply.code(401).send({ error: 'Sessão inválida' })
+        select u.id, u.tenant_id, u.full_name, u.active, u.session_epoch, u.sessions_valid_from, t.active as tenant_active
+        from users u join tenants t on t.id = u.tenant_id where u.id = ${dec.sub}`
+      if (!u?.active || !u.tenant_active) return reply.code(401).send({ error: 'Sessão inválida' })
+      // Senha redefinida pelo dono (ou acesso reactivado): as sessões anteriores deixam de valer.
+      if (u.sessions_valid_from && (dec.iat || 0) * 1000 < new Date(u.sessions_valid_from).getTime())
+        return reply.code(401).send({ error: 'Sessão terminada — entra de novo' })
       const roles = await sql`
-        select r.permissions from user_roles ur join roles r on r.id = ur.role_id
+        select r.code, r.permissions from user_roles ur join roles r on r.id = ur.role_id
         where ur.user_id = ${u.id}`
       const perms = [...new Set(roles.flatMap((r: any) => r.permissions))]
       const accessToken = app.jwt.sign(
-        { sub: u.id, tid: u.tenant_id, perms, name: u.full_name },
+        { sub: u.id, tid: u.tenant_id, perms, name: u.full_name, ep: Number(u.session_epoch || 0) },
         { expiresIn: process.env.JWT_EXPIRES || '8h' }
       )
-      return reply.send({ accessToken })
+      return reply.send({ accessToken, permissions: perms, roles: roles.map((r: any) => r.code) })
     } catch {
       return reply.code(401).send({ error: 'Sessão expirada — faz login novamente' })
     }
@@ -77,7 +82,8 @@ export async function authRoutes(app: FastifyInstance) {
       return reply.code(400).send({ error: 'Password actual incorrecta' })
 
     const hash = await bcrypt.hash(body.data.next, 12)
-    await sql`update users set password_hash = ${hash} where id = ${req.user.sub}`
+    await sql`update users set password_hash = ${hash}, must_change_password = false where id = ${req.user.sub}`
+    forgetSession(req.user.sub)
     return reply.send({ ok: true })
   })
 }

@@ -709,6 +709,10 @@ export async function receptionRoutes(app: FastifyInstance) {
                jo.is_non_runner, jo.entry_pending_reason, jo.entry_completed_at, jo.entry_type,
                jo.payment_status, jo.paid_amount,
                (select qc.status from qc_checks qc where qc.job_order_id = jo.id limit 1) as qc_status,
+               floor(extract(epoch from (now() - greatest(jo.updated_at,
+                 coalesce((select max(l.changed_at) from jo_state_log l where l.job_order_id = jo.id), jo.updated_at),
+                 coalesce((select max(t.changed_at) from job_service_transitions t join job_services s on s.id = t.job_service_id
+                           where s.job_order_id = jo.id), jo.updated_at)))) / 86400)::int as idle_days,
                (select count(*) from reception_photos rp
                 where rp.job_order_id = jo.id and rp.is_required = true) as req_photos,
                exists(select 1 from job_services js where js.job_order_id = jo.id

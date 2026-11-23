@@ -1,7 +1,9 @@
 // ============================================================
 // OFICINAHUB API — servidor
 // ============================================================
-import { probeTenantIsolation, tenantIsolation } from './lib/core.js'
+import { probeTenantIsolation, tenantIsolation, sessionState } from './lib/core.js'
+import { settingsRoutes } from './modules/settings.js'
+import { bulkRoutes } from './modules/bulk.js'
 import 'dotenv/config'
 import Fastify from 'fastify'
 import cors from '@fastify/cors'
@@ -61,6 +63,20 @@ app.decorate('auth', async (req: any, reply: any) => {
   try { await req.jwtVerify() } catch { reply.code(401).send({ error: 'Não autenticado' }) }
 })
 
+// Sessão ainda válida? (pessoa desactivada, papel ou senha mudados pelo dono)
+// Responde 401 → a app renova o acesso sozinha e apanha as permissões novas,
+// ou volta ao login se a pessoa já não puder entrar.
+app.addHook('onRequest', async (req: any, reply: any) => {
+  const h = req.headers.authorization
+  if (!h || !h.startsWith('Bearer ') || (req.url || '').startsWith('/auth/')) return
+  let p: any = null
+  try { p = app.jwt.decode(h.slice(7)) } catch { return }
+  if (!p?.sub) return
+  const st = await sessionState(p.sub)
+  if (!st) return
+  if (!st.active || Number(p.ep || 0) !== st.epoch) return reply.code(401).send({ error: 'Sessão desactualizada' })
+})
+
 await app.register(authRoutes)
 await app.register(receptionRoutes, { prefix: '/api/v1' })
 await app.register(taskRoutes, { prefix: '/api/v1' })
@@ -75,6 +91,8 @@ await app.register(adminRoutes, { prefix: '/api/v1' })
 await app.register(skillRoutes, { prefix: '/api/v1' })
 await app.register(ledgerRoutes, { prefix: '/api/v1' })
 await app.register(todayRoutes, { prefix: '/api/v1' })
+await app.register(settingsRoutes, { prefix: '/api/v1' })
+await app.register(bulkRoutes, { prefix: '/api/v1' })
 
 await probeTenantIsolation()
 app.get('/health', async () => ({ ok: true, product: 'OficinaHub', version: '1.0.0', tenantIsolation: tenantIsolation() }))
