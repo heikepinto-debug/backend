@@ -123,7 +123,7 @@ export async function osRoutes(app: FastifyInstance) {
     const { joId } = req.params
     try {
       return await withTenant(req.user.tid, async (tx) => {
-        const [jo] = await tx`select id, number, status, intentions, os_opened_at, entry_pending_reason, entry_completed_at from job_orders where id = ${joId}`
+        const [jo] = await tx`select id, number, status, intentions, os_opened_at, entry_pending_reason, entry_completed_at from job_orders where id = ${joId} and tenant_id = ${req.user.tid}`
         if (!jo) return reply.code(404).send({ error: 'Recepção não encontrada' })
         if (jo.os_opened_at) return reply.code(409).send({ error: 'OS já foi iniciada' })
         if (jo.status === 'draft') return reply.code(400).send({ error: 'Recepção ainda é rascunho' })
@@ -143,7 +143,7 @@ export async function osRoutes(app: FastifyInstance) {
           await tx`insert into problems (tenant_id, job_order_id, description, origin, sort_order, created_by)
             values (${req.user.tid}, ${joId}, ${text}, 'customer', ${order++}, ${req.user.sub})`
         }
-        await tx`update job_orders set status = 'in_diagnosis', os_opened_at = now(), os_opened_by = ${req.user.sub}, updated_at = now() where id = ${joId}`
+        await tx`update job_orders set status = 'in_diagnosis', os_opened_at = now(), os_opened_by = ${req.user.sub}, updated_at = now() where id = ${joId} and tenant_id = ${req.user.tid}`
         await logState(tx, req.user.tid, joId, jo.status, 'in_diagnosis', req.user.sub)
         await audit(tx, req.user.tid, req.user.sub, 'os.start', 'job_order', joId, { number: jo.number })
         return reply.code(201).send({ ok: true })
@@ -171,7 +171,7 @@ export async function osRoutes(app: FastifyInstance) {
           left join users us on us.id = jo.diag_submitted_by
           left join users ua on ua.id = jo.diag_authorized_by
           left join users ur on ur.id = jo.responsible_id
-          where jo.id = ${joId}`
+          where jo.id = ${joId} and jo.tenant_id = ${req.user.tid}`
         if (!jo) return reply.code(404).send({ error: 'não encontrada' })
         const problems = await tx`select p.*, s.type_name as service_name, s.status as service_status
           from problems p
@@ -248,7 +248,7 @@ export async function osRoutes(app: FastifyInstance) {
   // mesmo (completo) — isto só torna o QC acessível sem depender do fluxo
   // ter empurrado o carro até aqui, para não prender carros. Fica rasto
   // de onde veio.
-  app.post('/os/:joId/start-qc', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+  app.post('/os/:joId/start-qc', { preHandler: [guard('qc:approve')] }, async (req: any, reply) => {
     const { joId } = req.params
     return withTenant(req.user.tid, async (tx) => {
       const [jo] = await tx`select id, number, status from job_orders where id = ${joId} and tenant_id = ${req.user.tid}`
@@ -257,21 +257,21 @@ export async function osRoutes(app: FastifyInstance) {
       if (jo.status === 'cancelled') return reply.code(409).send({ error: 'O carro está cancelado' })
       if (jo.status === 'quality_check') return reply.send({ ok: true, already: true })
       const anterior = jo.status
-      await tx`update job_orders set status = 'quality_check', updated_at = now() where id = ${joId}`
+      await tx`update job_orders set status = 'quality_check', updated_at = now() where id = ${joId} and tenant_id = ${req.user.tid}`
       await logState(tx, req.user.tid, joId, anterior, 'quality_check', req.user.sub)
       await audit(tx, req.user.tid, req.user.sub, 'os.start_qc', 'job_order', joId, { number: jo.number, de: anterior })
       return reply.send({ ok: true, de: anterior })
     })
   })
 
-  app.post('/os/:joId/mark-ready', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+  app.post('/os/:joId/mark-ready', { preHandler: [guard('qc:approve')] }, async (req: any, reply) => {
     const { joId } = req.params
     return withTenant(req.user.tid, async (tx) => {
       const [jo] = await tx`select id, number, status from job_orders where id = ${joId} and tenant_id = ${req.user.tid}`
       if (!jo) return reply.code(404).send({ error: 'OS não encontrada' })
       if (['ready', 'delivered'].includes(jo.status)) return reply.code(409).send({ error: 'O carro já está pronto ou entregue' })
       const anterior = jo.status
-      await tx`update job_orders set status = 'ready', updated_at = now() where id = ${joId}`
+      await tx`update job_orders set status = 'ready', updated_at = now() where id = ${joId} and tenant_id = ${req.user.tid}`
       await logState(tx, req.user.tid, joId, anterior, 'ready', req.user.sub)
       await audit(tx, req.user.tid, req.user.sub, 'os.mark_ready', 'job_order', joId, { number: jo.number, de: anterior })
       return reply.send({ ok: true })
@@ -466,7 +466,7 @@ export async function osRoutes(app: FastifyInstance) {
   // serviço. Alimenta o orçamento. O preço só de pricing:manage.
   // Total a pagar de um carro — acessível a quem entrega (reception:read),
   // sem revelar margem/custos. Só o valor que o cliente paga.
-  app.get('/os/:joId/total', { preHandler: [guard('reception:read')] }, async (req: any) => {
+  app.get('/os/:joId/total', { preHandler: [guard('payment:register')] }, async (req: any) => {
     const { joId } = req.params
     return withTenant(req.user.tid, async (tx) => {
       const svcs = await tx`select coalesce(price,0) as price from job_services where job_order_id = ${joId} and tenant_id = ${req.user.tid} and status <> 'not_done'`
@@ -482,7 +482,7 @@ export async function osRoutes(app: FastifyInstance) {
   })
 
   // Marcar um carro como pago (a dona ou o Yury, na entrega).
-  app.post('/os/:joId/pay', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+  app.post('/os/:joId/pay', { preHandler: [guard('payment:register')] }, async (req: any, reply) => {
     const { joId } = req.params
     const b = z.object({
       amount: z.number().nonnegative(),
@@ -518,7 +518,7 @@ export async function osRoutes(app: FastifyInstance) {
 
   // Adicionar um SERVIÇO avulso ao carro (não vindo de um problema).
   // Ex.: o cliente pediu DPF delete — é um serviço a fazer, não um achado.
-  app.post('/os/:joId/services', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+  app.post('/os/:joId/services', { preHandler: [guard('os:manage')] }, async (req: any, reply) => {
     const { joId } = req.params
     const b = z.object({
       typeName: z.string().min(1).max(160),
@@ -542,7 +542,7 @@ export async function osRoutes(app: FastifyInstance) {
   })
 
   // Remover um serviço (enquanto não começou).
-  app.delete('/os/services/:sid', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+  app.delete('/os/services/:sid', { preHandler: [guard('os:manage')] }, async (req: any, reply) => {
     return withTenant(req.user.tid, async (tx) => {
       const [svc] = await tx`select id, status, from_problem_id from job_services where id = ${req.params.sid} and tenant_id = ${req.user.tid}`
       if (!svc) return reply.code(404).send({ error: 'Serviço não encontrado' })
@@ -580,21 +580,21 @@ export async function osRoutes(app: FastifyInstance) {
     })
   })
 
-  app.post('/os/:joId/responsible', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+  app.post('/os/:joId/responsible', { preHandler: [guard('os:manage')] }, async (req: any, reply) => {
     const { joId } = req.params
     const b = z.object({ userId: z.string().uuid().nullable() }).safeParse(req.body)
     if (!b.success) return reply.code(400).send({ error: 'Dados inválidos' })
     return withTenant(req.user.tid, async (tx) => {
       const [jo] = await tx`select id from job_orders where id = ${joId} and tenant_id = ${req.user.tid}`
       if (!jo) return reply.code(404).send({ error: 'OS não encontrada' })
-      await tx`update job_orders set responsible_id = ${b.data.userId} where id = ${joId}`
+      await tx`update job_orders set responsible_id = ${b.data.userId} where id = ${joId} and tenant_id = ${req.user.tid}`
       await audit(tx, req.user.tid, req.user.sub, 'os.responsible', 'job_order', joId, { userId: b.data.userId })
       return reply.send({ ok: true })
     })
   })
 
   // ── Executantes de um serviço (vários) ─────────────────────
-  app.post('/os/services/:sid/workers', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+  app.post('/os/services/:sid/workers', { preHandler: [guard('os:manage')] }, async (req: any, reply) => {
     const { sid } = req.params
     const b = z.object({ userId: z.string().uuid(), isHelper: z.boolean().default(false) }).safeParse(req.body)
     if (!b.success) return reply.code(400).send({ error: 'Dados inválidos' })
@@ -609,7 +609,7 @@ export async function osRoutes(app: FastifyInstance) {
     })
   })
 
-  app.delete('/os/services/:sid/workers/:uid', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+  app.delete('/os/services/:sid/workers/:uid', { preHandler: [guard('os:manage')] }, async (req: any, reply) => {
     const { sid, uid } = req.params
     return withTenant(req.user.tid, async (tx) => {
       await tx`delete from job_service_workers where job_service_id = ${sid} and user_id = ${uid} and tenant_id = ${req.user.tid}`
@@ -667,7 +667,7 @@ export async function osRoutes(app: FastifyInstance) {
   })
 
   // ── Converter um achado em serviço a fazer ─────────────────
-  app.post('/os/problems/:pid/to-service', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+  app.post('/os/problems/:pid/to-service', { preHandler: [guard('os:manage')] }, async (req: any, reply) => {
     const { pid } = req.params
     const b = z.object({
       typeName: z.string().min(2).max(160).optional(),   // nome do serviço; por defeito usa a descrição do achado
@@ -688,14 +688,14 @@ export async function osRoutes(app: FastifyInstance) {
       await tx`insert into job_service_transitions (tenant_id, job_service_id, from_status, to_status, reason, changed_by)
         values (${req.user.tid}, ${svc.id}, null, 'pending', 'Criado a partir do diagnóstico', ${req.user.sub})`
       // Marca o achado como convertido e liga-o ao serviço.
-      await tx`update problems set status = 'converted', resolved_service_id = ${svc.id}, updated_at = now() where id = ${pid}`
+      await tx`update problems set status = 'converted', resolved_service_id = ${svc.id}, updated_at = now() where id = ${pid} and tenant_id = ${req.user.tid}`
       await audit(tx, req.user.tid, req.user.sub, 'os.problem_to_service', 'problem', pid, { serviceId: svc.id, nome })
       return reply.send({ ok: true, serviceId: svc.id })
     })
   })
 
   // ── Dispensar um achado (não se faz), com motivo ───────────
-  app.post('/os/problems/:pid/dismiss', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+  app.post('/os/problems/:pid/dismiss', { preHandler: [guard('os:manage')] }, async (req: any, reply) => {
     const { pid } = req.params
     const b = z.object({ reason: z.string().min(2).max(500) }).safeParse(req.body || {})
     if (!b.success) return reply.code(400).send({ error: 'É preciso um motivo para dispensar.' })
@@ -703,20 +703,20 @@ export async function osRoutes(app: FastifyInstance) {
       const [p] = await tx`select id, resolved_service_id from problems where id = ${pid} and tenant_id = ${req.user.tid}`
       if (!p) return reply.code(404).send({ error: 'Achado não encontrado' })
       if (p.resolved_service_id) return reply.code(409).send({ error: 'Este achado já virou serviço — não se pode dispensar' })
-      await tx`update problems set status = 'dismissed', dismiss_reason = ${b.data.reason}, updated_at = now() where id = ${pid}`
+      await tx`update problems set status = 'dismissed', dismiss_reason = ${b.data.reason}, updated_at = now() where id = ${pid} and tenant_id = ${req.user.tid}`
       await audit(tx, req.user.tid, req.user.sub, 'os.problem_dismiss', 'problem', pid, { motivo: b.data.reason })
       return reply.send({ ok: true })
     })
   })
 
   // ── Reabrir um achado dispensado (volta a decidir) ─────────
-  app.post('/os/problems/:pid/reopen', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+  app.post('/os/problems/:pid/reopen', { preHandler: [guard('os:manage')] }, async (req: any, reply) => {
     const { pid } = req.params
     return withTenant(req.user.tid, async (tx) => {
       const [p] = await tx`select id, resolved_service_id from problems where id = ${pid} and tenant_id = ${req.user.tid}`
       if (!p) return reply.code(404).send({ error: 'Achado não encontrado' })
       if (p.resolved_service_id) return reply.code(409).send({ error: 'Já virou serviço' })
-      await tx`update problems set status = 'diagnosed', dismiss_reason = null, updated_at = now() where id = ${pid}`
+      await tx`update problems set status = 'diagnosed', dismiss_reason = null, updated_at = now() where id = ${pid} and tenant_id = ${req.user.tid}`
       await audit(tx, req.user.tid, req.user.sub, 'os.problem_reopen', 'problem', pid, {})
       return reply.send({ ok: true })
     })
@@ -741,7 +741,7 @@ export async function osRoutes(app: FastifyInstance) {
     const { pid } = req.params
     const b = req.body as any
     return withTenant(req.user.tid, async (tx) => {
-      const [p] = await tx`select id, job_order_id from problems where id = ${pid}`
+      const [p] = await tx`select id, job_order_id from problems where id = ${pid} and tenant_id = ${req.user.tid}`
       if (!p) return reply.code(404).send({ error: 'Problema não encontrado' })
       await tx`update problems set
         description = coalesce(${b.description ?? null}, description),
@@ -756,12 +756,12 @@ export async function osRoutes(app: FastifyInstance) {
   })
 
   // ── Apagar um problema ──────────────────────────────────────
-  app.delete('/os/problems/:pid', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+  app.delete('/os/problems/:pid', { preHandler: [guard('os:manage')] }, async (req: any, reply) => {
     const { pid } = req.params
     return withTenant(req.user.tid, async (tx) => {
-      const [p] = await tx`select job_order_id, description from problems where id = ${pid}`
+      const [p] = await tx`select job_order_id, description from problems where id = ${pid} and tenant_id = ${req.user.tid}`
       if (!p) return reply.code(404).send({ error: 'Problema não encontrado' })
-      await tx`delete from problems where id = ${pid}`
+      await tx`delete from problems where id = ${pid} and tenant_id = ${req.user.tid}`
       await audit(tx, req.user.tid, req.user.sub, 'os.problem_delete', 'problem', pid, {
         job_order_id: p.job_order_id, description: p.description,
       })
@@ -818,7 +818,7 @@ export async function osRoutes(app: FastifyInstance) {
     const { joId } = req.params
     const notes = String((req.body as any).notes || '')
     return withTenant(req.user.tid, async (tx) => {
-      const [jo] = await tx`select number, status from job_orders where id = ${joId}`
+      const [jo] = await tx`select number, status from job_orders where id = ${joId} and tenant_id = ${req.user.tid}`
       if (!jo) return reply.code(404).send({ error: 'OS não encontrada' })
       if (jo.status !== 'in_diagnosis') return reply.code(409).send({ error: 'OS não está em diagnóstico' })
       const [{ n }] = await tx`select count(*)::int as n from problems where job_order_id = ${joId}`
@@ -840,7 +840,7 @@ export async function osRoutes(app: FastifyInstance) {
     const { joId } = req.params
     const b = req.body as any
     return withTenant(req.user.tid, async (tx) => {
-      const [jo] = await tx`select number, status, diag_submitted_by from job_orders where id = ${joId}`
+      const [jo] = await tx`select number, status, diag_submitted_by from job_orders where id = ${joId} and tenant_id = ${req.user.tid}`
       if (!jo) return reply.code(404).send({ error: 'OS não encontrada' })
       if (jo.status !== 'diagnosis_review') return reply.code(409).send({ error: 'Diagnóstico não aguarda autorização' })
       // quem submeteu não pode autorizar o próprio diagnóstico

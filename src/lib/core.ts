@@ -18,13 +18,37 @@ export const supabase = createClient(
 
 export const BUCKET = process.env.STORAGE_BUCKET || 'reception-media'
 
+// ── Isolamento entre oficinas ────────────────────────────────
+// A ligação à base de dados é feita com o utilizador dono das tabelas,
+// a quem o RLS NÃO se aplica. Por isso, dentro de cada transação de
+// oficina, baixamos para o papel "oh_app" (criado na migration 0077),
+// que não tem bypass: a partir daí a base de dados só devolve e só
+// aceita linhas da oficina em current_tenant_id(), mesmo que uma query
+// se esqueça do filtro por tenant.
+// Se o papel ainda não existir (migration por aplicar), o servidor
+// continua a funcionar como antes e /health diz "off".
+let isolation: 'enforced' | 'off' = 'off'
+let lastProbe = 0
+export async function probeTenantIsolation(): Promise<'enforced' | 'off'> {
+  lastProbe = Date.now()
+  try {
+    await sql.begin(async (tx) => { await tx`set local role oh_app` })
+    isolation = 'enforced'
+  } catch { isolation = 'off' }
+  return isolation
+}
+export const tenantIsolation = () => isolation
+
 // ── Executa uma função com o tenant definido (activa o RLS) ──
 export async function withTenant<T>(
   tenantId: string,
   fn: (tx: postgres.TransactionSql) => Promise<T>
 ): Promise<T> {
+  // enquanto estiver "off", volta a tentar de minuto a minuto (ex.: migration aplicada depois do deploy)
+  if (isolation === 'off' && Date.now() - lastProbe > 60_000) await probeTenantIsolation()
   return sql.begin(async (tx) => {
     await tx`select set_config('app.current_tenant', ${tenantId}, true)`
+    if (isolation === 'enforced') await tx`set local role oh_app`
     return fn(tx)
   }) as Promise<T>
 }

@@ -95,6 +95,12 @@ export async function adminRoutes(app: FastifyInstance) {
           on conflict (tenant_id, slug) do nothing`
         await tx`update departments set tracks_vehicles = false where tenant_id = ${tid} and slug = 'loja'`
 
+        // 4·) Unidade (local físico) por defeito — sem ela não se consegue dar entrada a um carro.
+        await tx`insert into business_units (tenant_id, type, name) values (${tid}, 'workshop_normal', ${d.name})`
+
+        // 4a) Módulo de recepção activo (sem isto a oficina nova dava "Módulo M1 não activo").
+        await tx`insert into tenant_modules (tenant_id, module_code) values (${tid}, 'M1') on conflict do nothing`
+
         // 4b) Plano de categorias financeiras genérico (o dono ajusta depois).
         await tx`select seed_ledger_categories(${tid})`
 

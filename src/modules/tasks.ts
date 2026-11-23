@@ -9,6 +9,7 @@ import { withTenant, audit, can, supabase, BUCKET } from '../lib/core.js'
 
 function guard(perm: string) {
   return async (req: any, reply: any) => {
+    if (!req.user) { try { await req.jwtVerify() } catch { return reply.code(401).send({ error: 'Não autenticado' }) } }
     if (!can(req.user.perms, perm)) return reply.code(403).send({ error: 'Sem permissão' })
   }
 }
@@ -62,13 +63,13 @@ export async function taskRoutes(app: FastifyInstance) {
     if (!['jpg', 'jpeg', 'png', 'pdf'].includes(ext))
       return reply.code(400).send({ error: 'Só fotos ou PDF' })
     return withTenant(req.user.tid, async (tx) => {
-      const [t] = await tx`select assigned_to from tasks where id = ${id}`
+      const [t] = await tx`select assigned_to from tasks where id = ${id} and tenant_id = ${req.user.tid}`
       if (!t) return reply.code(404).send({ error: 'Tarefa não encontrada' })
       if (t.assigned_to !== req.user.sub) return reply.code(403).send({ error: 'Sem permissão' })
       const path = `${req.user.tid}/tasks/${id}.${ext}`
       const { data: signed, error } = await supabase.storage.from(BUCKET).createSignedUploadUrl(path)
       if (error) return reply.code(500).send({ error: 'Erro ao preparar upload' })
-      await tx`update tasks set attachment_path = ${path} where id = ${id}`
+      await tx`update tasks set attachment_path = ${path} where id = ${id} and tenant_id = ${req.user.tid}`
       return reply.send({ uploadUrl: signed.signedUrl, path })
     })
   })
@@ -120,7 +121,7 @@ export async function taskRoutes(app: FastifyInstance) {
     const isOwner = can(req.user.perms, 'jobdelete:any')
 
     return withTenant(req.user.tid, async (tx) => {
-      const [t] = await tx`select assigned_by, assigned_to, status, is_personal from tasks where id = ${id}`
+      const [t] = await tx`select assigned_by, assigned_to, status, is_personal from tasks where id = ${id} and tenant_id = ${req.user.tid}`
       if (!t) return reply.code(404).send({ error: 'Tarefa não encontrada' })
       if (t.status === 'done')
         return reply.code(409).send({ error: 'Tarefa concluída — já não pode ser editada.' })
@@ -215,7 +216,7 @@ export async function taskRoutes(app: FastifyInstance) {
     if (!['pending', 'in_progress', 'done'].includes(status))
       return reply.code(400).send({ error: 'Estado inválido' })
     return withTenant(req.user.tid, async (tx) => {
-      const [t] = await tx`select assigned_to, assigned_by, due_date, requires_confirmation, requires_attachment, attachment_path from tasks where id = ${id}`
+      const [t] = await tx`select assigned_to, assigned_by, due_date, requires_confirmation, requires_attachment, attachment_path from tasks where id = ${id} and tenant_id = ${req.user.tid}`
       if (!t) return reply.code(404).send({ error: 'Tarefa não encontrada' })
       if (t.assigned_to !== req.user.sub && t.assigned_by !== req.user.sub)
         return reply.code(403).send({ error: 'Sem permissão sobre esta tarefa' })
@@ -227,12 +228,12 @@ export async function taskRoutes(app: FastifyInstance) {
         const onTime = t.due_date ? new Date() <= new Date(t.due_date) : true
         // se exige confirmação de quem criou, vai para awaiting_confirmation
         if (t.requires_confirmation && req.user.sub === t.assigned_to) {
-          await tx`update tasks set status = 'awaiting_confirmation', completed_at = now(), was_on_time = ${onTime}, updated_at = now() where id = ${id}`
+          await tx`update tasks set status = 'awaiting_confirmation', completed_at = now(), was_on_time = ${onTime}, updated_at = now() where id = ${id} and tenant_id = ${req.user.tid}`
           return reply.send({ ok: true, status: 'awaiting_confirmation' })
         }
-        await tx`update tasks set status = 'done', completed_at = now(), was_on_time = ${onTime}, updated_at = now() where id = ${id}`
+        await tx`update tasks set status = 'done', completed_at = now(), was_on_time = ${onTime}, updated_at = now() where id = ${id} and tenant_id = ${req.user.tid}`
       } else {
-        await tx`update tasks set status = ${status}, completed_at = null, was_on_time = null, updated_at = now() where id = ${id}`
+        await tx`update tasks set status = ${status}, completed_at = null, was_on_time = null, updated_at = now() where id = ${id} and tenant_id = ${req.user.tid}`
       }
       return reply.send({ ok: true, status })
     })
@@ -242,11 +243,11 @@ export async function taskRoutes(app: FastifyInstance) {
   app.post('/tasks/:id/confirm', { preHandler: [(app as any).auth] }, async (req: any, reply) => {
     const { id } = req.params
     return withTenant(req.user.tid, async (tx) => {
-      const [t] = await tx`select assigned_by, status from tasks where id = ${id}`
+      const [t] = await tx`select assigned_by, status from tasks where id = ${id} and tenant_id = ${req.user.tid}`
       if (!t) return reply.code(404).send({ error: 'Tarefa não encontrada' })
       if (t.assigned_by !== req.user.sub) return reply.code(403).send({ error: 'Só quem atribuiu pode confirmar' })
       if (t.status !== 'awaiting_confirmation') return reply.code(409).send({ error: 'Tarefa não aguarda confirmação' })
-      await tx`update tasks set status = 'done', confirmed_by = ${req.user.sub}, confirmed_at = now(), updated_at = now() where id = ${id}`
+      await tx`update tasks set status = 'done', confirmed_by = ${req.user.sub}, confirmed_at = now(), updated_at = now() where id = ${id} and tenant_id = ${req.user.tid}`
       await audit(tx, req.user.tid, req.user.sub, 'task.confirm', 'task', id, {})
       return reply.send({ ok: true })
     })
@@ -256,10 +257,10 @@ export async function taskRoutes(app: FastifyInstance) {
   app.delete('/tasks/:id', { preHandler: [(app as any).auth] }, async (req: any, reply) => {
     const { id } = req.params
     return withTenant(req.user.tid, async (tx) => {
-      const [t] = await tx`select assigned_by from tasks where id = ${id}`
+      const [t] = await tx`select assigned_by from tasks where id = ${id} and tenant_id = ${req.user.tid}`
       if (!t) return reply.code(404).send({ error: 'Tarefa não encontrada' })
       if (t.assigned_by !== req.user.sub) return reply.code(403).send({ error: 'Só quem atribuiu pode apagar' })
-      await tx`delete from tasks where id = ${id}`
+      await tx`delete from tasks where id = ${id} and tenant_id = ${req.user.tid}`
       return reply.send({ ok: true })
     })
   })

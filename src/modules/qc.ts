@@ -55,7 +55,7 @@ export async function qcRoutes(app: FastifyInstance) {
   })
 
   // ── Marcar/desmarcar um item ───────────────────────────────
-  app.post('/os/:joId/qc/item', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+  app.post('/os/:joId/qc/item', { preHandler: [guard('qc:approve')] }, async (req: any, reply) => {
     const { joId } = req.params
     const b = z.object({ itemId: z.string().uuid(), checked: z.boolean(), note: z.string().max(500).nullable().optional() }).safeParse(req.body)
     if (!b.success) return reply.code(400).send({ error: 'Dados inválidos' })
@@ -73,7 +73,7 @@ export async function qcRoutes(app: FastifyInstance) {
   // ── Aprovar o QC (só o supervisor / QC) ────────────────────
   // Login = assinatura: fica registado quem aprovou. Exige que os
   // itens obrigatórios estejam todos marcados.
-  app.post('/os/:joId/qc/approve', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+  app.post('/os/:joId/qc/approve', { preHandler: [guard('qc:approve')] }, async (req: any, reply) => {
     const { joId } = req.params
     return withTenant(req.user.tid, async (tx) => {
       const [check] = await tx`select id from qc_checks where job_order_id = ${joId} and tenant_id = ${req.user.tid}`
@@ -97,21 +97,21 @@ export async function qcRoutes(app: FastifyInstance) {
       }
       if (faltam.length) return reply.code(400).send({ error: 'Faltam verificações obrigatórias', missing: faltam.length })
 
-      await tx`update qc_checks set status = 'approved', approved_by = ${req.user.sub}, approved_at = now(), reject_reason = null where id = ${check.id}`
+      await tx`update qc_checks set status = 'approved', approved_by = ${req.user.sub}, approved_at = now(), reject_reason = null where id = ${check.id} and tenant_id = ${req.user.tid}`
       await audit(tx, req.user.tid, req.user.sub, 'qc.approve', 'qc_check', check.id, { joId, responsabilidadeAssumida: true })
       return reply.send({ ok: true, approved: true })
     })
   })
 
   // ── Reprovar o QC (volta para correção) ────────────────────
-  app.post('/os/:joId/qc/reject', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+  app.post('/os/:joId/qc/reject', { preHandler: [guard('qc:approve')] }, async (req: any, reply) => {
     const { joId } = req.params
     const b = z.object({ reason: z.string().min(2).max(500) }).safeParse(req.body)
     if (!b.success) return reply.code(400).send({ error: 'É preciso indicar o motivo.' })
     return withTenant(req.user.tid, async (tx) => {
       const [check] = await tx`select id from qc_checks where job_order_id = ${joId} and tenant_id = ${req.user.tid}`
       if (!check) return reply.code(404).send({ error: 'QC não iniciado' })
-      await tx`update qc_checks set status = 'rejected', reject_reason = ${b.data.reason}, approved_by = null, approved_at = null where id = ${check.id}`
+      await tx`update qc_checks set status = 'rejected', reject_reason = ${b.data.reason}, approved_by = null, approved_at = null where id = ${check.id} and tenant_id = ${req.user.tid}`
       await audit(tx, req.user.tid, req.user.sub, 'qc.reject', 'qc_check', check.id, { joId, motivo: b.data.reason })
       return reply.send({ ok: true })
     })

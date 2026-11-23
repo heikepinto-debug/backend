@@ -483,7 +483,7 @@ export async function ppiRoutes(app: FastifyInstance) {
       // Token aleatório longo e não adivinhável.
       const token = insp.share_token || (await import('crypto')).randomBytes(24).toString('base64url')
       const expires = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString()
-      await tx`update ppi_inspections set share_token = ${token}, share_expires_at = ${expires} where id = ${id}`
+      await tx`update ppi_inspections set share_token = ${token}, share_expires_at = ${expires} where id = ${id} and tenant_id = ${req.user.tid}`
       await audit(tx, req.user.tid, req.user.sub, 'ppi.share', 'ppi_inspection', id, { days })
       return reply.send({ token, expiresAt: expires })
     })

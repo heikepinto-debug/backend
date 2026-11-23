@@ -235,7 +235,7 @@ export async function receptionRoutes(app: FastifyInstance) {
       // Caso A: finalizar um rascunho existente → actualiza e sela
       if (draftId) {
         const [existing] = await tx`
-          select id, number, status from job_orders where id = ${draftId}`
+          select id, number, status from job_orders where id = ${draftId} and tenant_id = ${req.user.tid}`
         if (existing && existing.status === 'draft') {
           const [jo] = await tx`
             update job_orders set
@@ -344,7 +344,7 @@ export async function receptionRoutes(app: FastifyInstance) {
 
       // Actualiza rascunho existente ou cria novo
       if (d.draftId) {
-        const [existing] = await tx`select id, number, status from job_orders where id = ${d.draftId}`
+        const [existing] = await tx`select id, number, status from job_orders where id = ${d.draftId} and tenant_id = ${req.user.tid}`
         if (existing && existing.status === 'draft') {
           await tx`
             update job_orders set
@@ -381,7 +381,7 @@ export async function receptionRoutes(app: FastifyInstance) {
           ${JSON.stringify(d.intentions)}, ${d.serviceDescription || null}, ${d.bookingDate || null},
           ${req.user.sub}, now()
         ) returning id, number`
-      if (d.bookingDate) await tx`update job_orders set booking_status = 'scheduled' where id = ${jo.id}`
+      if (d.bookingDate) await tx`update job_orders set booking_status = 'scheduled' where id = ${jo.id} and tenant_id = ${req.user.tid}`
       await syncJobServices(tx, req.user.tid, jo.id, req.user.sub, d.services)
       await audit(tx, req.user.tid, req.user.sub, 'reception.draft_save', 'job_order', jo.id, { number: jo.number })
       return reply.send({ id: jo.id, number: jo.number, draft: true })
@@ -471,7 +471,7 @@ export async function receptionRoutes(app: FastifyInstance) {
     const allowed = ['awaiting_diagnosis','awaiting_quote','quote_sent','approved','in_progress','quality_check','ready','delivered']
     if (!allowed.includes(status)) return reply.code(400).send({ error: 'Estado inválido' })
     return withTenant(req.user.tid, async (tx) => {
-      const [jo] = await tx`select number, status from job_orders where id = ${joId}`
+      const [jo] = await tx`select number, status from job_orders where id = ${joId} and tenant_id = ${req.user.tid}`
       if (!jo) return reply.code(404).send({ error: 'Entrada não encontrada' })
       // BARREIRA: não se entrega sem QC de saída aprovado.
       // Fecha o buraco que deixou um carro sair sem controlo de qualidade.
@@ -519,7 +519,7 @@ export async function receptionRoutes(app: FastifyInstance) {
           arrumados.diagnostico = true
         }
       }
-      await tx`update job_orders set status = ${status}::jo_status, updated_at = now() where id = ${joId}`
+      await tx`update job_orders set status = ${status}::jo_status, updated_at = now() where id = ${joId} and tenant_id = ${req.user.tid}`
       await audit(tx, req.user.tid, req.user.sub, 'reception.status_change', 'job_order', joId, { from: jo.status, to: status, forced: force && status === 'delivered', arrumados: (force && status === 'delivered') ? arrumados : undefined })
       return reply.send({ ok: true, status, arrumados: (force && status === 'delivered') ? arrumados : undefined })
     })
@@ -618,7 +618,7 @@ export async function receptionRoutes(app: FastifyInstance) {
         const [{ count }] = await tx`
           select count(*) from reception_photos
           where job_order_id = ${joId} and is_required = true`
-        const [joInfo] = await tx`select entry_pending_reason, entry_type from job_orders where id = ${joId}`
+        const [joInfo] = await tx`select entry_pending_reason, entry_type from job_orders where id = ${joId} and tenant_id = ${req.user.tid}`
         // Entrada rápida não tem as 14 fotos — é enxuta por desenho (PPI,
         // diagnóstico, serviços rápidos). Só a completa exige o conjunto.
         if (joInfo?.entry_type !== 'quick') {
@@ -665,7 +665,7 @@ export async function receptionRoutes(app: FastifyInstance) {
         .upload(path, buffer, { contentType: 'image/jpeg' })
       if (error) return reply.code(500).send({ error: 'Falha ao guardar documento' })
       return withTenant(req.user.tid, async (tx) => {
-        await tx`update job_orders set id_document_path = ${path} where id = ${joId}`
+        await tx`update job_orders set id_document_path = ${path} where id = ${joId} and tenant_id = ${req.user.tid}`
         // guarda na base de BIs (uma vez por número), se veio o número
         if (body.data.biNumber) {
           await tx`insert into identity_docs (tenant_id, bi_number, full_name, doc_path)
@@ -683,7 +683,7 @@ export async function receptionRoutes(app: FastifyInstance) {
     async (req: any, reply) => {
       const { joId } = req.params
       return withTenant(req.user.tid, async (tx) => {
-        const [jo] = await tx`select entry_pdf_path from job_orders where id = ${joId}`
+        const [jo] = await tx`select entry_pdf_path from job_orders where id = ${joId} and tenant_id = ${req.user.tid}`
         let path = jo?.entry_pdf_path
         if (!path) {                                  // ainda não gerado — gera agora
           try { path = await generateEntryPdf(req.user.tid, joId) }
@@ -748,7 +748,7 @@ export async function receptionRoutes(app: FastifyInstance) {
       const { joId } = req.params
       const hard = String((req.query as any).hard || '') === 'true'
       return withTenant(req.user.tid, async (tx) => {
-        const [jo] = await tx`select number, entry_pdf_path from job_orders where id = ${joId}`
+        const [jo] = await tx`select number, entry_pdf_path from job_orders where id = ${joId} and tenant_id = ${req.user.tid}`
         if (!jo) return reply.code(404).send({ error: 'Entrada não encontrada' })
 
         if (hard) {
@@ -758,10 +758,10 @@ export async function receptionRoutes(app: FastifyInstance) {
           if (jo.entry_pdf_path) paths.push(jo.entry_pdf_path)
           if (paths.length) { try { await supabase.storage.from(BUCKET).remove(paths) } catch {} }
           await tx`delete from reception_photos where job_order_id = ${joId}`
-          await tx`delete from job_orders where id = ${joId}`
+          await tx`delete from job_orders where id = ${joId} and tenant_id = ${req.user.tid}`
           await audit(tx, req.user.tid, req.user.sub, 'reception.hard_delete', 'job_order', joId, { number: jo.number })
         } else {
-          await tx`update job_orders set status = 'cancelled', updated_at = now() where id = ${joId}`
+          await tx`update job_orders set status = 'cancelled', updated_at = now() where id = ${joId} and tenant_id = ${req.user.tid}`
           await audit(tx, req.user.tid, req.user.sub, 'reception.cancel', 'job_order', joId, { number: jo.number })
         }
         return reply.send({ ok: true, deleted: hard })
@@ -796,7 +796,7 @@ export async function receptionRoutes(app: FastifyInstance) {
     return withTenant(req.user.tid, async (tx) => {
       const [jo] = await tx`select number, booking_date from job_orders where id = ${joId} and status = 'draft'`
       if (!jo) return reply.code(404).send({ error: 'Marcação não encontrada' })
-      await tx`update job_orders set booking_date = ${newDate}, booking_status = 'scheduled', updated_at = now() where id = ${joId}`
+      await tx`update job_orders set booking_date = ${newDate}, booking_status = 'scheduled', updated_at = now() where id = ${joId} and tenant_id = ${req.user.tid}`
       await audit(tx, req.user.tid, req.user.sub, 'booking.reschedule', 'job_order', joId, {
         number: jo.number, from: jo.booking_date, to: newDate,
       })
@@ -829,7 +829,7 @@ export async function receptionRoutes(app: FastifyInstance) {
     const reason = String((req.body as any).reason || '')
     if (!reason) return reply.code(400).send({ error: 'Motivo obrigatório' })
     return withTenant(req.user.tid, async (tx) => {
-      const [jo] = await tx`select number, deletion_status from job_orders where id = ${joId}`
+      const [jo] = await tx`select number, deletion_status from job_orders where id = ${joId} and tenant_id = ${req.user.tid}`
       if (!jo) return reply.code(404).send({ error: 'Entrada não encontrada' })
       if (jo.deletion_status === 'pending') return reply.code(409).send({ error: 'Já existe um pedido pendente' })
       await tx`update job_orders set deletion_status = 'pending', deletion_reason = ${reason},
@@ -863,7 +863,7 @@ export async function receptionRoutes(app: FastifyInstance) {
     const approve = (req.body as any).approve === true
     const note = String((req.body as any).note || '')
     return withTenant(req.user.tid, async (tx) => {
-      const [jo] = await tx`select number, deletion_status from job_orders where id = ${joId}`
+      const [jo] = await tx`select number, deletion_status from job_orders where id = ${joId} and tenant_id = ${req.user.tid}`
       if (!jo) return reply.code(404).send({ error: 'Entrada não encontrada' })
       if (jo.deletion_status !== 'pending') return reply.code(409).send({ error: 'Sem pedido pendente' })
       if (approve) {
@@ -1034,7 +1034,7 @@ export async function receptionRoutes(app: FastifyInstance) {
   })
 
   // ── PRIORIDADE: definir nível + razão ───────────────────────
-  app.post('/receptions/:joId/priority', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+  app.post('/receptions/:joId/priority', { preHandler: [guard('os:manage')] }, async (req: any, reply) => {
     const { joId } = req.params
     const b = req.body as any
     const level = String(b.level || '')
@@ -1042,7 +1042,7 @@ export async function receptionRoutes(app: FastifyInstance) {
       return reply.code(400).send({ error: 'Nível inválido' })
     if (!b.reason) return reply.code(400).send({ error: 'Razão obrigatória' })
     return withTenant(req.user.tid, async (tx) => {
-      const [jo] = await tx`select number, priority_set_by from job_orders where id = ${joId}`
+      const [jo] = await tx`select number, priority_set_by from job_orders where id = ${joId} and tenant_id = ${req.user.tid}`
       if (!jo) return reply.code(404).send({ error: 'Entrada não encontrada' })
       // é uma correcção do dono? (alguém já tinha definido, e quem altera é diferente)
       const isOwner = can(req.user.perms, 'jobdelete:any')
@@ -1053,7 +1053,7 @@ export async function receptionRoutes(app: FastifyInstance) {
         priority_set_by = ${req.user.sub}, priority_set_at = now(),
         updated_at = now() where id = ${joId}`
       if (isCorrection) {
-        await tx`update job_orders set priority_corrected_by = ${req.user.sub}, priority_corrected_at = now() where id = ${joId}`
+        await tx`update job_orders set priority_corrected_by = ${req.user.sub}, priority_corrected_at = now() where id = ${joId} and tenant_id = ${req.user.tid}`
       }
       await audit(tx, req.user.tid, req.user.sub, isCorrection ? 'priority.correct' : 'priority.set', 'job_order', joId, {
         number: jo.number, level, reason: b.reason, corrected: isCorrection,

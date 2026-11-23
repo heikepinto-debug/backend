@@ -54,8 +54,8 @@ export async function supplierRoutes(app: FastifyInstance) {
         name = coalesce(${d.name?.trim() ?? null}, name),
         active = coalesce(${d.active ?? null}, active)
         where id = ${req.params.id} and tenant_id = ${req.user.tid}`
-      if (d.contact !== undefined) await tx`update suppliers set contact = ${d.contact} where id = ${req.params.id}`
-      if (d.notes !== undefined) await tx`update suppliers set notes = ${d.notes} where id = ${req.params.id}`
+      if (d.contact !== undefined) await tx`update suppliers set contact = ${d.contact} where id = ${req.params.id} and tenant_id = ${req.user.tid}`
+      if (d.notes !== undefined) await tx`update suppliers set notes = ${d.notes} where id = ${req.params.id} and tenant_id = ${req.user.tid}`
       return reply.send({ ok: true })
     })
   })
@@ -101,7 +101,7 @@ export async function supplierRoutes(app: FastifyInstance) {
   // O custo só é ACEITE de quem tem finance:read. Se quem edita
   // não tem essa permissão, o custo enviado é ignorado (não se
   // apaga o que lá está).
-  app.post('/os/services/:sid/outsource', { preHandler: [guard('reception:read')] }, async (req: any, reply) => {
+  app.post('/os/services/:sid/outsource', { preHandler: [guard('os:manage')] }, async (req: any, reply) => {
     const { sid } = req.params
     const b = z.object({
       outsourced: z.boolean(),

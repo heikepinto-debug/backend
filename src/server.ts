@@ -1,6 +1,7 @@
 // ============================================================
 // OFICINAHUB API — servidor
 // ============================================================
+import { probeTenantIsolation, tenantIsolation } from './lib/core.js'
 import 'dotenv/config'
 import Fastify from 'fastify'
 import cors from '@fastify/cors'
@@ -73,7 +74,8 @@ await app.register(adminRoutes, { prefix: '/api/v1' })
 await app.register(skillRoutes, { prefix: '/api/v1' })
 await app.register(ledgerRoutes, { prefix: '/api/v1' })
 
-app.get('/health', async () => ({ ok: true, product: 'OficinaHub', version: '1.0.0' }))
+await probeTenantIsolation()
+app.get('/health', async () => ({ ok: true, product: 'OficinaHub', version: '1.0.0', tenantIsolation: tenantIsolation() }))
 
 const port = Number(process.env.PORT) || 3000
 await app.listen({ port, host: '0.0.0.0' })
