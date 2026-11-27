@@ -191,7 +191,7 @@ export async function osRoutes(app: FastifyInstance) {
             }
           } catch { /* sem fotos — segue */ }
         }
-        const [tenant] = await tx`select diag_authorization_on from tenants where id = ${req.user.tid}`
+        const [tenant] = await tx`select diag_authorization_on, scan_required from tenants where id = ${req.user.tid}`
         // Serviços do carro, cada um com o seu estado e quem o trata.
         const podeCusto = can(req.user.perms, 'finance:read')
         const podePreco = can(req.user.perms, 'pricing:manage')
@@ -231,7 +231,7 @@ export async function osRoutes(app: FastifyInstance) {
         const team = await tx`select id, full_name from users where tenant_id = ${req.user.tid} and active = true order by full_name`
         // Catálogo de tipos de serviço (para acrescentar serviços rápido).
         const serviceTypes = await tx`select id, name from service_types where tenant_id = ${req.user.tid} and active = true order by sort_order, name`
-        return { jo, problems, services, team, serviceTypes, diagAuthorizationOn: tenant?.diag_authorization_on ?? true }
+        return { jo, problems, services, team, serviceTypes, diagAuthorizationOn: tenant?.diag_authorization_on ?? true, scanRequired: tenant?.scan_required ?? true }
       })
     } catch (e: any) {
       app.log.error({ err: e, joId }, 'os load failed')
@@ -819,13 +819,16 @@ export async function osRoutes(app: FastifyInstance) {
     const { joId } = req.params
     const notes = String((req.body as any).notes || '')
     return withTenant(req.user.tid, async (tx) => {
-      const [jo] = await tx`select number, status from job_orders where id = ${joId} and tenant_id = ${req.user.tid}`
+      const [jo] = await tx`select number, status, scan_status from job_orders where id = ${joId} and tenant_id = ${req.user.tid}`
       if (!jo) return reply.code(404).send({ error: 'OS não encontrada' })
       if (jo.status !== 'in_diagnosis') return reply.code(409).send({ error: 'OS não está em diagnóstico' })
       const [{ n }] = await tx`select count(*)::int as n from problems where job_order_id = ${joId}`
       if (n === 0) return reply.code(400).send({ error: 'Adiciona pelo menos um problema antes de submeter' })
 
-      const [tenant] = await tx`select diag_authorization_on from tenants where id = ${req.user.tid}`
+      const [tenant] = await tx`select diag_authorization_on, scan_required from tenants where id = ${req.user.tid}`
+      // Novo workflow: sem diagnóstico electrónico (ou excepção justificada) não se fecha o diagnóstico.
+      if ((tenant?.scan_required ?? true) && jo.scan_status === 'pending')
+        return reply.code(400).send({ error: 'Falta o diagnóstico electrónico (scan). Junta o relatório ou pede à gestão para justificar a excepção.', needsScan: true })
       const authOn = tenant?.diag_authorization_on ?? true
       const next = authOn ? 'diagnosis_review' : 'awaiting_quote'
       await tx`update job_orders set status = ${next}, diagnosis_notes = ${notes || null},

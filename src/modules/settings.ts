@@ -138,7 +138,7 @@ export async function settingsRoutes(app: FastifyInstance) {
   // ── DEFINIÇÕES DA OFICINA ───────────────────────────────────
   app.get('/settings/workshop', { preHandler: [guard('config:manage')] }, async (req: any) => {
     return withTenant(req.user.tid, async (tx) => {
-      const [t] = await tx`select name, nuit, phone, email, address, brand_primary_color, diag_authorization_on, allow_third_party_signer, stale_days
+      const [t] = await tx`select name, nuit, phone, email, address, brand_primary_color, diag_authorization_on, allow_third_party_signer, stale_days, scan_required
                            from tenants where id = ${req.user.tid}`
       return { workshop: t }
     })
@@ -150,7 +150,7 @@ export async function settingsRoutes(app: FastifyInstance) {
       nuit: z.string().trim().max(40).nullable().optional(), phone: z.string().trim().max(40).nullable().optional(),
       email: z.string().trim().max(160).nullable().optional(), address: z.string().trim().max(300).nullable().optional(),
       brandColor: z.string().regex(/^#[0-9a-fA-F]{6}$/, 'Cor inválida'),
-      diagAuthorizationOn: z.boolean(), allowThirdPartySigner: z.boolean(), staleDays: z.number().int().min(1).max(60).optional(),
+      diagAuthorizationOn: z.boolean(), allowThirdPartySigner: z.boolean(), staleDays: z.number().int().min(1).max(60).optional(), scanRequired: z.boolean().optional(),
     }).safeParse(req.body)
     if (!p.success) return reply.code(400).send({ error: 'Confirma o nome da oficina e a cor.' })
     const d = p.data
@@ -158,7 +158,8 @@ export async function settingsRoutes(app: FastifyInstance) {
       await tx`update tenants set name = ${d.name}, nuit = ${d.nuit || null}, phone = ${d.phone || null}, email = ${d.email || null},
                address = ${d.address || null}, brand_primary_color = ${d.brandColor},
                diag_authorization_on = ${d.diagAuthorizationOn}, allow_third_party_signer = ${d.allowThirdPartySigner},
-               stale_days = coalesce(${d.staleDays ?? null}, stale_days)
+               stale_days = coalesce(${d.staleDays ?? null}, stale_days),
+               scan_required = coalesce(${d.scanRequired ?? null}, scan_required)
                where id = ${req.user.tid}`
       await audit(tx, req.user.tid, req.user.sub, 'settings.workshop', 'tenant', req.user.tid, { nome: d.name, cor: d.brandColor })
       return reply.send({ ok: true })

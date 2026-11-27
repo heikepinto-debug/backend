@@ -709,6 +709,7 @@ export async function receptionRoutes(app: FastifyInstance) {
                jo.is_non_runner, jo.entry_pending_reason, jo.entry_completed_at, jo.entry_type,
                jo.payment_status, jo.paid_amount,
                (select qc.status from qc_checks qc where qc.job_order_id = jo.id limit 1) as qc_status,
+               jo.scan_status,
                floor(extract(epoch from (now() - greatest(jo.updated_at,
                  coalesce((select max(l.changed_at) from jo_state_log l where l.job_order_id = jo.id), jo.updated_at),
                  coalesce((select max(t.changed_at) from job_service_transitions t join job_services s on s.id = t.job_service_id
@@ -1124,11 +1125,15 @@ export async function receptionRoutes(app: FastifyInstance) {
       make: z.string().max(80).nullable().optional(),
       model: z.string().max(80).nullable().optional(),
       note: z.string().max(600).nullable().optional(),
+      plate: z.string().max(20).nullable().optional(),
       bookingDate: z.string().nullable().optional(),
       assignTo: z.string().uuid().nullable().optional(),
     }).safeParse(req.body)
     if (!b.success) return reply.code(400).send({ error: 'Dados inválidos' })
     const d = b.data
+    // Nada é obrigatório — mas uma marcação totalmente vazia não serve a ninguém.
+    if (![d.customerName, d.customerPhone, d.make, d.model, d.note, d.plate].some(x => (x || '').trim()))
+      return reply.code(400).send({ error: 'Escreve pelo menos uma coisa: um nome, um contacto, o carro ou o que precisa.' })
     return withTenant(req.user.tid, async (tx) => {
       let assignTo = d.assignTo ?? null
       if (!assignTo) {
@@ -1141,9 +1146,9 @@ export async function receptionRoutes(app: FastifyInstance) {
         assignTo = sup?.id ?? null
       }
       const [qb] = await tx`
-        insert into quick_bookings (tenant_id, customer_name, customer_phone, make, model, note, booking_date, assigned_to, created_by)
+        insert into quick_bookings (tenant_id, customer_name, customer_phone, make, model, note, plate, booking_date, assigned_to, created_by)
         values (${req.user.tid}, ${d.customerName?.trim() || null}, ${d.customerPhone?.trim() || null},
-                ${d.make?.trim() || null}, ${d.model?.trim() || null}, ${d.note?.trim() || null},
+                ${d.make?.trim() || null}, ${d.model?.trim() || null}, ${d.note?.trim() || null}, ${d.plate?.trim().toUpperCase() || null},
                 ${d.bookingDate || null}, ${assignTo}, ${req.user.sub})
         returning id`
       await audit(tx, req.user.tid, req.user.sub, 'booking.quick_create', 'quick_booking', qb.id, { customer: d.customerName || d.customerPhone })
@@ -1156,7 +1161,7 @@ export async function receptionRoutes(app: FastifyInstance) {
     return withTenant(req.user.tid, async (tx) => {
       const podeVerTudo = can(req.user.perms, 'jobdelete:any') || can(req.user.perms, 'reception:create')
       const rows = await tx`
-        select qb.id, qb.customer_name, qb.customer_phone, qb.make, qb.model, qb.note,
+        select qb.id, qb.customer_name, qb.customer_phone, qb.make, qb.model, qb.note, qb.plate,
                qb.booking_date, qb.assigned_to, qb.created_at,
                cu.full_name as created_by_name, au.full_name as assigned_to_name
         from quick_bookings qb
@@ -1177,6 +1182,43 @@ export async function receptionRoutes(app: FastifyInstance) {
         where tenant_id = ${req.user.tid} and status = 'pending'
           and (${podeVerTudo} or assigned_to = ${req.user.sub})`
       return { count: r?.n || 0 }
+    })
+  })
+
+  // Corrigir ou remarcar uma marcação simples.
+  app.post('/bookings/leads/:id/update', { preHandler: [guard('reception:create')] }, async (req: any, reply) => {
+    const b = z.object({
+      customerName: z.string().max(160).nullable().optional(), customerPhone: z.string().max(40).nullable().optional(),
+      make: z.string().max(80).nullable().optional(), model: z.string().max(80).nullable().optional(),
+      note: z.string().max(600).nullable().optional(), plate: z.string().max(20).nullable().optional(),
+      bookingDate: z.string().nullable().optional(),
+    }).safeParse(req.body)
+    if (!b.success) return reply.code(400).send({ error: 'Dados inválidos' })
+    const d = b.data
+    return withTenant(req.user.tid, async (tx) => {
+      const [q] = await tx`select * from quick_bookings where id = ${req.params.id} and tenant_id = ${req.user.tid} and status = 'pending'`
+      if (!q) return reply.code(404).send({ error: 'Marcação não encontrada' })
+      const v = (novo: any, velho: any) => novo === undefined ? velho : (String(novo ?? '').trim() || null)
+      await tx`update quick_bookings set customer_name = ${v(d.customerName, q.customer_name)}, customer_phone = ${v(d.customerPhone, q.customer_phone)},
+               make = ${v(d.make, q.make)}, model = ${v(d.model, q.model)}, note = ${v(d.note, q.note)},
+               plate = ${d.plate === undefined ? q.plate : (String(d.plate ?? '').trim().toUpperCase() || null)},
+               booking_date = ${d.bookingDate === undefined ? q.booking_date : (d.bookingDate || null)}, updated_at = now()
+               where id = ${q.id} and tenant_id = ${req.user.tid}`
+      await audit(tx, req.user.tid, req.user.sub, 'booking.quick_update', 'quick_booking', q.id, {})
+      return reply.send({ ok: true })
+    })
+  })
+
+  // Cancelar uma marcação simples (com motivo).
+  app.post('/bookings/leads/:id/cancel', { preHandler: [guard('reception:create')] }, async (req: any, reply) => {
+    const reason = String((req.body as any)?.reason || '').trim().slice(0, 200)
+    if (reason.length < 2) return reply.code(400).send({ error: 'Indica o motivo.' })
+    return withTenant(req.user.tid, async (tx) => {
+      const r = await tx`update quick_bookings set status = 'cancelled', cancel_reason = ${reason}, updated_at = now()
+                         where id = ${req.params.id} and tenant_id = ${req.user.tid} and status = 'pending' returning id`
+      if (!r.length) return reply.code(404).send({ error: 'Marcação não encontrada' })
+      await audit(tx, req.user.tid, req.user.sub, 'booking.quick_cancel', 'quick_booking', req.params.id, { motivo: reason })
+      return reply.send({ ok: true })
     })
   })
 

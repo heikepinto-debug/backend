@@ -4,6 +4,7 @@
 import { probeTenantIsolation, tenantIsolation, sessionState } from './lib/core.js'
 import { settingsRoutes } from './modules/settings.js'
 import { bulkRoutes } from './modules/bulk.js'
+import { scanRoutes } from './modules/scan.js'
 import 'dotenv/config'
 import Fastify from 'fastify'
 import cors from '@fastify/cors'
@@ -93,6 +94,7 @@ await app.register(ledgerRoutes, { prefix: '/api/v1' })
 await app.register(todayRoutes, { prefix: '/api/v1' })
 await app.register(settingsRoutes, { prefix: '/api/v1' })
 await app.register(bulkRoutes, { prefix: '/api/v1' })
+await app.register(scanRoutes, { prefix: '/api/v1' })
 
 await probeTenantIsolation()
 app.get('/health', async () => ({ ok: true, product: 'OficinaHub', version: '1.0.0', tenantIsolation: tenantIsolation() }))

@@ -89,7 +89,11 @@ export async function todayRoutes(app: FastifyInstance) {
                                     and booking_date::date <= current_date)::int as bookings,
                  count(*) filter (where booking_date is null)::int as drafts
           from job_orders where tenant_id = ${tid} and status = 'draft'`
-        if (b?.bookings) needs.push({ key: 'bookings', count: b.bookings, cars: [] })
+        // + as marcações simples (sem ficha ainda) de hoje, em atraso ou sem data
+        const [l] = await tx`select count(*)::int as n from quick_bookings
+          where tenant_id = ${tid} and status = 'pending' and (booking_date is null or booking_date::date <= current_date)`
+        const nMarc = (b?.bookings || 0) + (l?.n || 0)
+        if (nMarc) needs.push({ key: 'bookings', count: nMarc, cars: [] })
         if (b?.drafts) needs.push({ key: 'drafts', count: b.drafts, cars: [] })
       }
 
@@ -124,6 +128,14 @@ export async function todayRoutes(app: FastifyInstance) {
             ? { ...mini(r), number: r.number, customer: r.customer, status: 'draft', kind: 'booking', days: dias(r.booking_date), since: r.booking_date }
             : { ...mini(r), number: r.number, customer: r.customer, status: 'draft', kind: 'draft', days: dias(r.updated_at), since: r.updated_at }),
         ].filter((r: any) => r.days >= prazo)
+        // marcações simples cuja data já passou há mais dias do que o prazo: têm de
+        // ser tratadas na própria marcação (chegou, remarcar ou cancelar) — não se justificam.
+        const leads = await tx`
+          select id, customer_name, customer_phone, make, model, plate, booking_date from quick_bookings
+          where tenant_id = ${tid} and status = 'pending' and booking_date is not null`
+        const leadsParados = leads.map((r: any) => ({ id: r.id, plate: r.plate, brand: r.make, model: r.model, number: null,
+            customer: r.customer_name || r.customer_phone, status: 'draft', kind: 'lead', days: dias(r.booking_date), since: r.booking_date }))
+          .filter((r: any) => r.days >= prazo)
         const acks = todos.length ? await tx`
           select distinct on (a.job_order_id) a.job_order_id, a.reason, a.note, a.snooze_until, a.created_at, u.full_name as by_name
           from stale_acks a left join users u on u.id = a.user_id
@@ -138,6 +150,8 @@ export async function todayRoutes(app: FastifyInstance) {
             treated.push({ ...r, reason: a.reason, note: a.note, until: a.snooze_until, by: a.by_name })
           else untreated.push(r)
         }
+        untreated.push(...leadsParados)
+        untreated.sort((a: any, b: any) => b.days - a.days)
         stale = { days: prazo, untreated, treated }
       }
 
